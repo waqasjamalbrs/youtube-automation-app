@@ -1,6 +1,6 @@
 streamlit
-google-generativeai
 deepgram-sdk
+google-generativeai
 opencv-python-headless
 google-api-python-client
 google-auth
