@@ -208,7 +208,7 @@ def encode_upload_to_data_url(uploaded_file):
 def analyze_images_with_groq(image_files):
     """
     Groq vision (Llama 4 Scout) se image descriptions.
-    Max 5 images per request, isliye batching.
+    Max 5 images per request, batching.
     Returns: dict {filename: description}
     """
     if not image_files:
@@ -282,6 +282,7 @@ def analyze_images_with_groq(image_files):
 def create_sync_plan_with_groq(script_text, image_desc_map):
     """
     Groq text model se JSON timeline (image + duration).
+    Always returns: list[ {image, duration_seconds: float} ]
     """
     if not image_desc_map:
         return []
@@ -307,7 +308,9 @@ Desired JSON format:
 ]
 
 Rules:
-- Only return valid JSON, no explanation.
+- Only return valid JSON.
+- JSON may be either a list directly, or an object with a top-level key
+  like "timeline" or "scenes" that contains the list.
 - "image" must be one of the provided filenames.
 - "duration_seconds" must be a positive number.
 - Rough total duration should match the length of the script.
@@ -322,10 +325,49 @@ Rules:
             temperature=0.2,
         )
         text = resp.choices[0].message.content or "[]"
-        return json.loads(text)
+        data = json.loads(text)
     except Exception as e:
         st.warning(f"⚠️ Groq planning failed, using fallback slideshow. Error: {e}")
         return []
+
+    # --- normalize shape ---
+    if isinstance(data, list):
+        raw_timeline = data
+    elif isinstance(data, dict):
+        if "timeline" in data and isinstance(data["timeline"], list):
+            raw_timeline = data["timeline"]
+        elif "scenes" in data and isinstance(data["scenes"], list):
+            raw_timeline = data["scenes"]
+        else:
+            # maybe directly {image:.., duration_seconds:..} ?
+            raw_timeline = data.get("items", [])
+            if not isinstance(raw_timeline, list):
+                raw_timeline = []
+    else:
+        raw_timeline = []
+
+    normalized = []
+    for entry in raw_timeline:
+        if not isinstance(entry, dict):
+            continue
+        img = entry.get("image") or entry.get("filename")
+        if not img:
+            continue
+        dur = (
+            entry.get("duration_seconds")
+            or entry.get("duration")
+            or entry.get("seconds")
+            or 5
+        )
+        try:
+            dur = float(dur)
+        except Exception:
+            dur = 5.0
+        if dur <= 0:
+            dur = 5.0
+        normalized.append({"image": img, "duration_seconds": dur})
+
+    return normalized
 
 
 # ------------------ VIDEO RENDERING ------------------
@@ -336,6 +378,15 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     OpenCV + FFmpeg: images -> video frames -> merge with audio.
     Shows percentage progress, respects stop flag.
     """
+    # Extra safety: empty timeline -> quick fallback
+    if not timeline:
+        # simple 5 second slideshow
+        image_names = list(image_map.keys())
+        if not image_names:
+            st.error("No images available for rendering.")
+            return None
+        timeline = [{"image": name, "duration_seconds": 5.0} for name in image_names]
+
     width, height = 854, 480
     fps = 24
 
@@ -349,7 +400,14 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     progress_bar = st.progress(0)
     percent_text = st.empty()
 
-    total_sec = sum([t["duration_seconds"] for t in timeline])
+    # total_sec calculation with float safety
+    total_sec = 0.0
+    for t in timeline:
+        if isinstance(t, dict):
+            try:
+                total_sec += float(t.get("duration_seconds", 0))
+            except Exception:
+                continue
     total_frames_all = max(int(total_sec * fps), 1)
     current_frame = 0
 
@@ -359,10 +417,16 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
             out.release()
             return None
 
-        img_name = item["image"]
-        duration = item["duration_seconds"]
+        if not isinstance(item, dict):
+            continue
 
-        if img_name not in image_map:
+        img_name = item.get("image")
+        try:
+            duration = float(item.get("duration_seconds", 0))
+        except Exception:
+            duration = 5.0
+
+        if not img_name or img_name not in image_map or duration <= 0:
             continue
 
         image_map[img_name].seek(0)
