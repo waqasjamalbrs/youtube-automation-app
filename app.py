@@ -225,7 +225,7 @@ def analyze_images_batch(image_files):
         try:
             response = model.generate_content(inputs)
             descriptions[f"Batch_{i}"] = response.text
-            time.sleep(5)
+            time.sleep(10)
         except Exception as e:
             # 429 ya koi bhi error ho -> warn + break, baaki slideshow use hoga
             st.warning(f"Batch {i} failed: {e}")
@@ -247,7 +247,7 @@ def create_sync_plan(script_text, image_descriptions_dict):
         return []  # direct fallback
 
     genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
     desc_text = json.dumps(image_descriptions_dict)
 
