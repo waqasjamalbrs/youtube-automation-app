@@ -2,7 +2,6 @@ import streamlit as st
 import cv2
 import numpy as np
 import google.generativeai as genai
-from deepgram import DeepgramClient, PrerecordedOptions
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2 import service_account
