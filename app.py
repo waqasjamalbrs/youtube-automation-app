@@ -187,7 +187,7 @@ def analyze_images_batch(image_files):
     Up to 5 images per call, rate-limit friendly.
     """
     genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
     descriptions = {}
     batch_size = 5
