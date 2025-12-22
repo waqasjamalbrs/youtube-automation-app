@@ -23,8 +23,10 @@ st.set_page_config(page_title="AI Video Generator", page_icon="🎬", layout="wi
 if "stop_requested" not in st.session_state:
     st.session_state.stop_requested = False
 
+
 def request_stop():
     st.session_state.stop_requested = True
+
 
 # ------------- LOAD SECRETS (Streamlit / secrets.toml) -------------
 
@@ -34,7 +36,10 @@ try:
     GCP_CREDS = st.secrets["gcp_service_account"]
     ROOT_FOLDER_ID = st.secrets["ROOT_FOLDER_ID"]
 except Exception:
-    st.error("🚨 Secrets missing! Please configure DEEPGRAM_API_KEY, GEMINI_API_KEY, ROOT_FOLDER_ID and [gcp_service_account].")
+    st.error(
+        "🚨 Secrets missing! Please configure DEEPGRAM_API_KEY, GEMINI_API_KEY, "
+        "ROOT_FOLDER_ID and [gcp_service_account] in secrets."
+    )
     st.stop()
 
 # ------------- TEMP DIR -------------
@@ -56,23 +61,30 @@ def get_drive_service():
 
 
 def get_or_create_subfolder(service, folder_name, parent_id):
-    """Check parent access, then get or create subfolder."""
-    # sanity check: parent folder accessible?
+    """
+    Given parent folder ID, uske andar ek subfolder lao ya banao.
+    Agar parent_id access na ho paya to gracefully service account ka "root"
+    use kar le, taake app crash na kare.
+    """
+    original_parent = parent_id
+
+    # Soft check: parent folder accessible?
     try:
-        service.files().get(fileId=parent_id, fields="id, name").execute()
+        service.files().get(fileId=parent_id, fields="id").execute()
     except Exception as e:
-        st.error(
-            f"Cannot access ROOT_FOLDER_ID='{parent_id}'. "
-            "Make sure this folder exists and is shared with the service account email."
+        st.warning(
+            f"⚠️ Cannot access ROOT_FOLDER_ID='{parent_id}'. "
+            "Falling back to the service account root folder instead."
         )
         st.write(e)
-        raise
+        parent_id = "root"
 
-    q = (
+    query = (
         "mimeType='application/vnd.google-apps.folder' "
         f"and name='{folder_name}' and '{parent_id}' in parents and trashed=false"
     )
-    results = service.files().list(q=q, fields="files(id, name)").execute()
+
+    results = service.files().list(q=query, fields="files(id, name)").execute()
     files = results.get("files", [])
 
     if files:
@@ -84,16 +96,15 @@ def get_or_create_subfolder(service, folder_name, parent_id):
         "parents": [parent_id],
     }
 
-    try:
-        folder = service.files().create(body=file_metadata, fields="id").execute()
-        return folder["id"]
-    except Exception as e:
-        st.error(
-            "Drive create error while making AI_Final_Videos. "
-            "Most likely a permission issue on ROOT_FOLDER_ID."
+    folder = service.files().create(body=file_metadata, fields="id").execute()
+
+    if parent_id == "root" and original_parent != "root":
+        st.info(
+            "Created AI_Final_Videos in the service account root, "
+            "because the configured ROOT_FOLDER_ID was not accessible."
         )
-        st.write(e)
-        raise
+
+    return folder["id"]
 
 
 def upload_to_drive(file_path, file_name, folder_id):
