@@ -10,6 +10,7 @@ import shutil
 import requests
 import base64
 from io import BytesIO
+import tempfile
 
 # ------------------ CONFIG & GLOBALS ------------------
 
@@ -43,12 +44,28 @@ except Exception:
 # Groq client
 groq_client = Groq(api_key=GROQ_KEY)
 
-# ------------- TEMP DIR -------------
+# ------------- TEMP DIR (use /tmp, safer on Streamlit Cloud) -------------
 
-TEMP_DIR = "temp_processing"
-if os.path.exists(TEMP_DIR):
-    shutil.rmtree(TEMP_DIR)
-os.makedirs(TEMP_DIR, exist_ok=True)
+BASE_TEMP_DIR = os.path.join(tempfile.gettempdir(), "ai_video_app")
+os.makedirs(BASE_TEMP_DIR, exist_ok=True)
+TEMP_DIR = BASE_TEMP_DIR  # hum isi ko use karenge
+
+
+def clean_temp_dir():
+    """Har run se pehle temp dir ke andar ki files clean kar do."""
+    if not os.path.exists(TEMP_DIR):
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        return
+    for name in os.listdir(TEMP_DIR):
+        path = os.path.join(TEMP_DIR, name)
+        try:
+            if os.path.isfile(path) or os.path.islink(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+        except Exception:
+            pass
+
 
 # ------------------ UTILS ------------------
 
@@ -428,7 +445,6 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     temp_video = os.path.join(TEMP_DIR, "temp_silent.mp4")
     final_output = os.path.join(TEMP_DIR, output_name)
 
-    # absolute paths (important for ffmpeg)
     temp_video_abs = os.path.abspath(temp_video)
     audio_abs = os.path.abspath(audio_path)
     final_output_abs = os.path.abspath(final_output)
@@ -489,7 +505,7 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
         st.warning("⛔ Processing stopped before audio merge.")
         return None
 
-    # ✔ ensure files exist before ffmpeg
+    # ensure files exist
     if not os.path.exists(audio_abs):
         st.error(f"❌ Audio file not found for FFmpeg: {audio_abs}")
         return None
@@ -568,12 +584,24 @@ if st.button("🚀 Generate video", type="primary"):
     else:
         status = st.status("Starting process...", expanded=True)
 
-        # 1. Save audio (absolute path)
+        # 0. clean temp dir
+        status.write("🧹 Cleaning temp folder...")
+        clean_temp_dir()
+
+        # 1. Save audio (in /tmp/ai_video_app)
         status.write("💾 Saving audio file...")
         local_audio = os.path.join(TEMP_DIR, "input.mp3")
         local_audio = os.path.abspath(local_audio)
         with open(local_audio, "wb") as f:
             f.write(audio_file.getbuffer())
+
+        # sanity info
+        if os.path.exists(local_audio):
+            size_kb = os.path.getsize(local_audio) / 1024
+            st.info(f"Audio saved: {local_audio} ({size_kb:.1f} KB)")
+        else:
+            st.error("❌ Failed to save audio file.")
+            st.stop()
 
         audio_duration = get_audio_duration(local_audio)
 
