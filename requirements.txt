@@ -1,9 +1,9 @@
 streamlit
-google-generativeai>=0.8.3
+groq
+deepgram-sdk  # (ab tum REST use kar rahe ho, ye optional hai; chahe to hata do)
 opencv-python-headless
 google-api-python-client
 google-auth
 numpy
 requests
 pillow
-
