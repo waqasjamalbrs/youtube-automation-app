@@ -1,0 +1,9 @@
+streamlit
+google-generativeai
+deepgram-sdk
+opencv-python-headless
+google-api-python-client
+google-auth
+numpy
+requests
+pillow
