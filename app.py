@@ -13,6 +13,9 @@ import shutil
 import time
 import requests  # Deepgram REST API ke liye
 
+# --- GOOGLE DRIVE SCOPES (BOHOT IMPORTANT) ---
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
 # --- PAGE SETUP ---
 st.set_page_config(page_title="AI Video Generator", page_icon="🎬", layout="wide")
 
@@ -20,27 +23,32 @@ st.set_page_config(page_title="AI Video Generator", page_icon="🎬", layout="wi
 try:
     DEEPGRAM_KEY = st.secrets["DEEPGRAM_API_KEY"]
     GEMINI_KEY = st.secrets["GEMINI_API_KEY"]
-    GCP_CREDS = st.secrets["gcp_service_account"]
-    ROOT_FOLDER_ID = st.secrets["ROOT_FOLDER_ID"]
+    GCP_CREDS = st.secrets["gcp_service_account"]  # [gcp_service_account] block
+    ROOT_FOLDER_ID = st.secrets["ROOT_FOLDER_ID"]  # sirf folder ID, URL nahi
 except Exception as e:
-    st.error("🚨 Secrets missing! Please configure .streamlit/secrets.toml / Cloud Secrets.")
+    st.error("🚨 Secrets missing! Please configure secrets.toml / Streamlit Secrets.")
     st.stop()
 
 # --- TEMP FOLDERS ---
 TEMP_DIR = "temp_processing"
 if os.path.exists(TEMP_DIR):
-    shutil.rmtree(TEMP_DIR)  # Clean start every run
+    shutil.rmtree(TEMP_DIR)  # har run par clean start
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # ==========================================
 # 1. GOOGLE DRIVE FUNCTIONS (Auto-Storage)
 # ==========================================
 def get_drive_service():
-    creds = service_account.Credentials.from_service_account_info(GCP_CREDS)
+    """Service Account + Drive.file scope se Drive client banao."""
+    creds = service_account.Credentials.from_service_account_info(
+        GCP_CREDS,
+        scopes=SCOPES,
+    )
     return build("drive", "v3", credentials=creds)
 
 
 def get_or_create_subfolder(service, folder_name, parent_id):
+    """Given parent folder ID, uske andar ek subfolder lao ya banao."""
     query = (
         f"mimeType='application/vnd.google-apps.folder' "
         f"and name='{folder_name}' and '{parent_id}' in parents and trashed=false"
@@ -50,17 +58,18 @@ def get_or_create_subfolder(service, folder_name, parent_id):
 
     if files:
         return files[0]["id"]
-    else:
-        file_metadata = {
-            "name": folder_name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        }
-        folder = service.files().create(body=file_metadata, fields="id").execute()
-        return folder["id"]
+
+    file_metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = service.files().create(body=file_metadata, fields="id").execute()
+    return folder["id"]
 
 
 def upload_to_drive(file_path, file_name, folder_id):
+    """Final mp4 ko Drive pe upload karo."""
     service = get_drive_service()
     file_metadata = {"name": file_name, "parents": [folder_id]}
     media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
@@ -80,17 +89,17 @@ def upload_to_drive(file_path, file_name, folder_id):
 def get_transcript(audio_path):
     """
     Deepgram REST API se Audio -> Text
-    (SDK ke bina, isliye Streamlit par import error nahi aayega)
+    (SDK ki zaroorat nahi, isliye import error nahi aayega)
     """
     url = "https://api.deepgram.com/v1/listen"
 
     headers = {
         "Authorization": f"Token {DEEPGRAM_KEY}",
-        "Content-Type": "audio/mpeg",  # mp3 ke liye
+        "Content-Type": "audio/mpeg",  # MP3 ke liye
     }
 
     params = {
-        "model": "nova-2",       # agar account support kare to 'nova-3' bhi use kar sakte ho
+        "model": "nova-2",       # agar account allow kare to "nova-3" bhi use kar sakte ho
         "smart_format": "true",
     }
 
@@ -119,12 +128,12 @@ def get_transcript(audio_path):
     start = words[0]["start"] if words else 0.0
     end = words[-1]["end"] if words else 0.0
 
-    # Tumhara baaki code list-of-dicts expect karta hai
+    # Baaki code list-of-dicts expect karta hai
     return [{"text": text, "start": start, "end": end}]
 
 
 def analyze_images_batch(image_files):
-    """Gemini Vision: 5 Images per call to save Rate Limit"""
+    """Gemini Vision: 5 images per call, rate limit friendly."""
     genai.configure(api_key=GEMINI_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
 
@@ -138,17 +147,17 @@ def analyze_images_batch(image_files):
     progress_bar = st.progress(0)
     status = st.empty()
 
-    # List of tuples (filename, file_object)
     img_list = [(img.name, img) for img in image_files]
 
     for i in range(0, total_images, batch_size):
         batch = img_list[i : i + batch_size]
         status.text(
-            f"👁️ Analyzing Images {i+1} to {min(i+batch_size, total_images)}..."
+            f"👁️ Analyzing images {i+1} to {min(i+batch_size, total_images)}..."
         )
 
         inputs = [
-            "Describe each image briefly with its filename. Format: Filename: Description"
+            "Describe each image briefly with its filename. "
+            "Format exactly as: Filename: Description"
         ]
 
         for name, file_obj in batch:
@@ -158,10 +167,9 @@ def analyze_images_batch(image_files):
             inputs.append(img)
 
         try:
-            # Single API Call for up to 5 Images
             response = model.generate_content(inputs)
             descriptions[f"Batch_{i}"] = response.text
-            time.sleep(2)  # Safety Sleep for Rate Limit
+            time.sleep(2)  # small delay for safety
         except Exception as e:
             st.warning(f"Batch {i} failed: {e}")
 
@@ -171,20 +179,33 @@ def analyze_images_batch(image_files):
 
 
 def create_sync_plan(script_text, image_descriptions_dict):
-    """Gemini Brain: Match Script with Image Descriptions"""
+    """Gemini se JSON timeline banwana: image + duration."""
     genai.configure(api_key=GEMINI_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
 
     desc_text = json.dumps(image_descriptions_dict)
 
     prompt = f"""
-    SCRIPT: "{script_text}"
-    IMAGE DESCRIPTIONS: {desc_text}
+    SCRIPT:
+    \"\"\"{script_text}\"\"\"
 
-    TASK: Create a JSON timeline. Map images to the script based on context.
-    FORMAT: [{{ "image": "filename.jpg", "duration_seconds": 5.0 }}]
-    Ensure total duration roughly matches script length.
-    RETURN ONLY JSON.
+    IMAGE_DESCRIPTIONS_JSON:
+    {desc_text}
+
+    TASK:
+    Create a JSON timeline that maps images to the script based on context.
+
+    Desired JSON format:
+    [
+      {{ "image": "filename1.jpg", "duration_seconds": 5.0 }},
+      {{ "image": "filename2.jpg", "duration_seconds": 4.0 }}
+    ]
+
+    Rules:
+    - Only return valid JSON, no extra text.
+    - "image" value must match one of the provided filenames.
+    - "duration_seconds" should be a positive number.
+    - Rough total duration should match the length of the script.
     """
 
     try:
@@ -200,8 +221,8 @@ def create_sync_plan(script_text, image_descriptions_dict):
 # 3. VIDEO RENDERING (OpenCV + FFmpeg)
 # ==========================================
 def render_video(timeline, audio_path, image_map, output_name="final_video.mp4"):
-    # Settings: 480p is BEST for free cloud servers (Fast & Low RAM)
-    width, height = 854, 480
+    """Images ko frames me convert karke audio ke sath sync karein."""
+    width, height = 854, 480  # 480p – cloud friendly
     fps = 24
 
     temp_video = os.path.join(TEMP_DIR, "temp_silent.mp4")
@@ -210,10 +231,9 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(temp_video, fourcc, fps, (width, height))
 
-    st.write("🎥 Rendering Video Frames...")
+    st.write("🎥 Rendering video frames...")
     my_bar = st.progress(0)
 
-    # Calculate total frames for progress bar
     total_sec = sum([t["duration_seconds"] for t in timeline])
     total_frames_all = max(int(total_sec * fps), 1)
     current_frame = 0
@@ -225,7 +245,6 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
         if img_name not in image_map:
             continue
 
-        # Convert UploadedFile to OpenCV Image
         image_map[img_name].seek(0)
         file_bytes = np.asarray(bytearray(image_map[img_name].read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, 1)
@@ -233,13 +252,10 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
         if img is None:
             continue
 
-        # Resize
         img = cv2.resize(img, (width, height))
-
         frames_in_clip = max(int(duration * fps), 1)
 
         for i in range(frames_in_clip):
-            # Light Zoom Effect
             scale = 1.0 + (0.05 * i / frames_in_clip)
             M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
             zoomed = cv2.warpAffine(img, M, (width, height))
@@ -247,7 +263,6 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
             out.write(zoomed)
             current_frame += 1
 
-            # Update UI every 50 frames
             if current_frame % 50 == 0:
                 my_bar.progress(
                     min(current_frame / float(total_frames_all), 1.0)
@@ -255,9 +270,11 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
 
     out.release()
 
-    # FFmpeg Merge (RAM Safe Method)
-    st.write("🎵 Merging Audio...")
-    command = f'ffmpeg -y -i "{temp_video}" -i "{audio_path}" -c:v copy -c:a aac -shortest "{final_output}"'
+    st.write("🎵 Merging audio with video...")
+    command = (
+        f'ffmpeg -y -i "{temp_video}" -i "{audio_path}" '
+        f'-c:v copy -c:a aac -shortest "{final_output}"'
+    )
     subprocess.run(command, shell=True)
 
     return final_output
@@ -268,22 +285,23 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
 # ==========================================
 st.title("🤖 Free AI Video Generator")
 st.markdown(
-    "Stack: **Deepgram** (Audio) + **Gemini** (Vision/Logic) + **OpenCV** (Render) + **Google Drive**"
+    "Stack: **Deepgram** (Audio) + **Gemini** (Vision/Logic) "
+    "+ **OpenCV** (Render) + **Google Drive** (Backup)"
 )
 
 col1, col2 = st.columns(2)
 with col1:
-    audio_file = st.file_uploader("Upload Voiceover (MP3)", type=["mp3"])
+    audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
 with col2:
     uploaded_images = st.file_uploader(
-        "Upload Images", type=["jpg", "png", "jpeg"], accept_multiple_files=True
+        "Upload images", type=["jpg", "jpeg", "png"], accept_multiple_files=True
     )
 
 if st.button("🚀 Generate Video", type="primary"):
     if not audio_file or not uploaded_images:
-        st.error("Please upload both audio and images!")
+        st.error("Please upload both audio and images first.")
     else:
-        status = st.status("Starting Process...", expanded=True)
+        status = st.status("Starting process...", expanded=True)
 
         # 1. Setup Drive
         status.write("📂 Setting up Google Drive...")
@@ -292,13 +310,14 @@ if st.button("🚀 Generate Video", type="primary"):
             service, "AI_Final_Videos", ROOT_FOLDER_ID
         )
 
-        # 2. Save Audio Local
+        # 2. Save audio locally
+        status.write("💾 Saving audio file...")
         local_audio = os.path.join(TEMP_DIR, "input.mp3")
         with open(local_audio, "wb") as f:
             f.write(audio_file.getbuffer())
 
         # 3. Transcribe
-        status.write("👂 Listening to Audio (Deepgram)...")
+        status.write("👂 Listening to audio with Deepgram...")
         transcript = get_transcript(local_audio)
         if not transcript:
             st.error("❌ Could not get transcript from audio.")
@@ -306,17 +325,16 @@ if st.button("🚀 Generate Video", type="primary"):
 
         full_text = " ".join([t["text"] for t in transcript])
 
-        # 4. Analyze Images
-        status.write("👁️ Analyzing Images (Gemini Vision Batch)...")
+        # 4. Analyze images
+        status.write("👁️ Analyzing images with Gemini Vision...")
         image_desc = analyze_images_batch(uploaded_images)
 
-        # 5. Plan Video
-        status.write("🧠 Planning Scenes (Gemini Logic)...")
+        # 5. Plan video
+        status.write("🧠 Planning scenes with Gemini Logic...")
         plan = create_sync_plan(full_text, image_desc)
 
-        # Fallback if AI fails
         if not plan:
-            status.write("⚠️ AI Plan failed, using simple slideshow.")
+            status.write("⚠️ AI plan failed, using simple slideshow.")
             image_names = [img.name for img in uploaded_images]
             avg_dur = 5.0
             try:
@@ -325,15 +343,15 @@ if st.button("🚀 Generate Video", type="primary"):
                 pass
             plan = [{"image": name, "duration_seconds": avg_dur} for name in image_names]
 
-        # 6. Render
-        status.write("🎬 Rendering Video (OpenCV)...")
+        # 6. Render video
+        status.write("🎬 Rendering video with OpenCV...")
         image_map = {img.name: img for img in uploaded_images}
         final_vid_path = render_video(plan, local_audio, image_map)
 
-        # 7. Upload
-        status.write("☁️ Uploading to Drive...")
+        # 7. Upload to Drive
+        status.write("☁️ Uploading final video to Google Drive...")
         file_id = upload_to_drive(final_vid_path, "AI_Gen_Video.mp4", final_folder_id)
 
-        status.update(label="✅ Video Completed!", state="complete", expanded=False)
-        st.success(f"Video Saved to Google Drive! (File ID: {file_id})")
+        status.update(label="✅ Video completed!", state="complete", expanded=False)
+        st.success(f"Video saved to Google Drive! File ID: {file_id}")
         st.video(final_vid_path)
