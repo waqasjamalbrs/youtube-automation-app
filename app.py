@@ -239,16 +239,20 @@ def map_chunks_to_images_groq_vision(chunks, uploaded_images):
       - chunks: [{index, text, start, end}, ...]
       - uploaded_images: Streamlit UploadedFile list
 
-    Prompt structure:
-      - Pehle instruction + images (Image 1, Image 2, ...)
-      - Phir CHUNKS ka JSON (sirf index + text)
-      - Output: JSON { "mappings": [ {"chunk_index": 1, "image_index": 2}, ... ] }
-
     Return:
       - cleaned_mappings = [ {"chunk_index": int, "image": real_filename}, ... ]
       - raw_response_json (for debug)
     """
     if not chunks or not uploaded_images:
+        return [], None
+
+    # 🔴 IMPORTANT: model limit = max 5 images
+    if len(uploaded_images) > 5:
+        st.warning(
+            "⚠️ Groq vision model ek request me **max 5 images** support karta hai. "
+            "Aap ne 5 se zyada images di hain, is liye AI-based mapping skip ho kar "
+            "simple sequential mapping use hogi."
+        )
         return [], None
 
     model_id = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -273,9 +277,9 @@ def map_chunks_to_images_groq_vision(chunks, uploaded_images):
                 "- Distribute chunks sensibly across images (do NOT assign all chunks to the same image).\n\n"
                 "Return ONLY JSON in this exact format:\n"
                 "{\n"
-                '  "mappings": [\n'
-                '    { "chunk_index": 1, "image_index": 2 },\n'
-                '    { "chunk_index": 2, "image_index": 1 }\n'
+                '  \"mappings\": [\n'
+                '    { \"chunk_index\": 1, \"image_index\": 2 },\n'
+                '    { \"chunk_index\": 2, \"image_index\": 1 }\n'
                 "  ]\n"
                 "}\n"
                 "Where:\n"
@@ -570,13 +574,14 @@ st.markdown(
 
 1. Deepgram → audio ko **chunks + timestamps** me todta hai  
 2. Groq Vision (mapping step) → **images ko dekh kar** har chunk ke liye image choose karta hai  
-3. Agar mapping bakwaas ho (sab chunks same image) → **auto sequential fallback**  
-4. OpenCV + FFmpeg → exact durations ke saath video render  
+   - Sirf tab tak jab tak images ≤ 5  
+   - Agar images > 5 → AI mapping skip, simple sequential mapping use hoti hai  
+3. OpenCV + FFmpeg → exact durations ke saath video render  
 
 Neeche debug expanders me tum 1–1 cheez dekh sakte ho:
 - Deepgram ka raw JSON + chunks
 - Groq ka raw mapping JSON
-- Clean mapping (chunk_index → image_index → filename)
+- Clean mapping (chunk_index → image filename)
 - Final timeline (image + duration_seconds)
 """
 )
