@@ -54,9 +54,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 def get_audio_duration(audio_path: str):
-    """
-    ffprobe se audio ki duration (seconds) nikal lo.
-    """
+    """ffprobe se audio ki duration (seconds) nikal lo."""
     try:
         result = subprocess.run(
             [
@@ -418,7 +416,7 @@ def build_equal_slideshow(image_names, audio_duration=None):
 def render_video(timeline, audio_path, image_map, output_name="final_video.mp4"):
     """
     OpenCV + FFmpeg: images -> video frames -> merge with audio.
-    Yahan FFmpeg ka output check kar rahe hain, file size bhi check kar rahe hain.
+    Absolute paths + checks to avoid 'No such file' errors.
     """
     if not timeline:
         st.error("No timeline provided.")
@@ -430,8 +428,13 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     temp_video = os.path.join(TEMP_DIR, "temp_silent.mp4")
     final_output = os.path.join(TEMP_DIR, output_name)
 
+    # absolute paths (important for ffmpeg)
+    temp_video_abs = os.path.abspath(temp_video)
+    audio_abs = os.path.abspath(audio_path)
+    final_output_abs = os.path.abspath(final_output)
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(temp_video, fourcc, fps, (width, height))
+    out = cv2.VideoWriter(temp_video_abs, fourcc, fps, (width, height))
 
     st.write("🎥 Rendering video frames...")
     progress_bar = st.progress(0)
@@ -486,20 +489,28 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
         st.warning("⛔ Processing stopped before audio merge.")
         return None
 
+    # ✔ ensure files exist before ffmpeg
+    if not os.path.exists(audio_abs):
+        st.error(f"❌ Audio file not found for FFmpeg: {audio_abs}")
+        return None
+    if not os.path.exists(temp_video_abs):
+        st.error(f"❌ Temp video not found for FFmpeg: {temp_video_abs}")
+        return None
+
     st.write("🎵 Merging audio with video (FFmpeg)...")
     command = [
         "ffmpeg",
         "-y",
         "-i",
-        temp_video,
+        temp_video_abs,
         "-i",
-        audio_path,
+        audio_abs,
         "-c:v",
         "copy",
         "-c:a",
         "aac",
         "-shortest",
-        final_output,
+        final_output_abs,
     ]
     result = subprocess.run(
         command,
@@ -513,18 +524,17 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
         st.code(result.stdout[-2000:])
         return None
 
-    # file existence + size check
-    if not os.path.exists(final_output):
+    if not os.path.exists(final_output_abs):
         st.error("❌ Final video file was not created.")
         st.code(result.stdout[-2000:])
         return None
 
-    if os.path.getsize(final_output) < 1024:  # <1KB => probably broken
+    if os.path.getsize(final_output_abs) < 1024:
         st.error("❌ Final video seems too small / corrupted.")
         st.code(result.stdout[-2000:])
         return None
 
-    return final_output
+    return final_output_abs
 
 
 # ------------------ UI ------------------
@@ -551,16 +561,17 @@ with col2:
 st.button("🛑 Stop processing", on_click=request_stop)
 
 if st.button("🚀 Generate video", type="primary"):
-    st.session_state.stop_requested = False  # reset flag
+    st.session_state.stop_requested = False
 
     if not audio_file or not uploaded_images:
         st.error("Please upload both audio and images first.")
     else:
         status = st.status("Starting process...", expanded=True)
 
-        # 1. Save audio
+        # 1. Save audio (absolute path)
         status.write("💾 Saving audio file...")
         local_audio = os.path.join(TEMP_DIR, "input.mp3")
+        local_audio = os.path.abspath(local_audio)
         with open(local_audio, "wb") as f:
             f.write(audio_file.getbuffer())
 
@@ -629,7 +640,7 @@ if st.button("🚀 Generate video", type="primary"):
         else:
             st.success("Video rendered! You can watch or download it below.")
 
-        # IMPORTANT: read bytes instead of passing path directly
+        # Read bytes instead of passing path directly
         try:
             with open(final_vid_path, "rb") as f:
                 video_bytes = f.read()
