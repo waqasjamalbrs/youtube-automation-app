@@ -2,23 +2,16 @@ import streamlit as st
 import cv2
 import numpy as np
 from groq import Groq
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError, ResumableUploadError
-from google.oauth2 import service_account
 from PIL import Image
 import json
 import subprocess
 import os
 import shutil
-import time
 import requests
 import base64
 from io import BytesIO
 
 # ------------------ CONFIG & GLOBALS ------------------
-
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 st.set_page_config(page_title="AI Video Generator (Groq)", page_icon="🎬", layout="wide")
 
@@ -36,12 +29,10 @@ def request_stop():
 try:
     DEEPGRAM_KEY = st.secrets["DEEPGRAM_API_KEY"]
     GROQ_KEY = st.secrets["GROQ_API_KEY"]
-    GCP_CREDS = st.secrets["gcp_service_account"]
-    ROOT_FOLDER_ID = st.secrets["ROOT_FOLDER_ID"]
 except Exception:
     st.error(
-        "🚨 Secrets missing! Please configure DEEPGRAM_API_KEY, GROQ_API_KEY, "
-        "ROOT_FOLDER_ID and [gcp_service_account] in secrets."
+        "🚨 Secrets missing! Please configure DEEPGRAM_API_KEY and GROQ_API_KEY "
+        "in your Streamlit secrets."
     )
     st.stop()
 
@@ -54,146 +45,6 @@ TEMP_DIR = "temp_processing"
 if os.path.exists(TEMP_DIR):
     shutil.rmtree(TEMP_DIR)
 os.makedirs(TEMP_DIR, exist_ok=True)
-
-# ------------------ GOOGLE DRIVE HELPERS ------------------
-
-
-def get_drive_service():
-    creds = service_account.Credentials.from_service_account_info(
-        GCP_CREDS,
-        scopes=SCOPES,
-    )
-    return build("drive", "v3", credentials=creds)
-
-
-def get_or_create_subfolder(service, folder_name, parent_id):
-    """
-    Try to use given parent_id. Agar access fail ho ya 404 aaye,
-    quietly service account ke root ('root') pe fallback kar do.
-    """
-    effective_parent = parent_id
-
-    def list_in_parent(pid):
-        q = (
-            "mimeType='application/vnd.google-apps.folder' "
-            f"and name='{folder_name}' and '{pid}' in parents and trashed=false"
-        )
-        return service.files().list(q=q, fields="files(id, name)").execute().get(
-            "files", []
-        )
-
-    # 1) Try LIST in given parent
-    try:
-        files = list_in_parent(effective_parent)
-    except Exception as e:
-        st.warning(
-            f"⚠️ Cannot access ROOT_FOLDER_ID='{parent_id}'. "
-            "Using the service account root folder instead."
-        )
-        st.write(e)
-        effective_parent = "root"
-        files = list_in_parent(effective_parent)
-
-    if files:
-        return files[0]["id"]
-
-    # 2) Try CREATE in that parent. If create fail, retry in root.
-    file_metadata = {
-        "name": folder_name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [effective_parent],
-    }
-
-    try:
-        folder = service.files().create(body=file_metadata, fields="id").execute()
-        return folder["id"]
-    except Exception as e:
-        if effective_parent != "root":
-            st.warning(
-                "⚠️ Could not create folder in custom ROOT_FOLDER_ID, "
-                "retrying in service account root."
-            )
-            file_metadata["parents"] = ["root"]
-            folder = service.files().create(body=file_metadata, fields="id").execute()
-            return folder["id"]
-        else:
-            st.error("❌ Drive error while creating folder.")
-            st.write(e)
-            raise
-
-
-def upload_to_drive(file_path, file_name, folder_id):
-    """
-    Google Drive par video upload:
-    - Resumable upload with chunks
-    - Error par simple upload fallback
-    - Progress bar Streamlit me
-    """
-    service = get_drive_service()
-    file_metadata = {"name": file_name, "parents": [folder_id]}
-
-    # 5 MB chunks for resumable upload
-    chunk_size = 5 * 1024 * 1024
-
-    media = MediaFileUpload(
-        file_path,
-        mimetype="video/mp4",
-        chunksize=chunk_size,
-        resumable=True,
-    )
-
-    st.info(f"☁️ Uploading {file_name} to Google Drive (resumable)...")
-    request = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id",
-    )
-
-    response = None
-    upload_bar = st.progress(0)
-    last_progress = 0
-
-    try:
-        while response is None:
-            status, response = request.next_chunk()
-            if status:
-                prog = int(status.progress() * 100)
-                if prog != last_progress:
-                    upload_bar.progress(prog / 100.0)
-                    last_progress = prog
-    except ResumableUploadError as e:
-        # Resumable upload fail ho gaya – simple upload se retry
-        st.warning(
-            "⚠️ Resumable upload failed, trying a simpler upload instead.\n\n"
-            f"Details: {e}"
-        )
-        try:
-            media = MediaFileUpload(
-                file_path,
-                mimetype="video/mp4",
-                resumable=False,
-            )
-            response = (
-                service.files()
-                .create(body=file_metadata, media_body=media, fields="id")
-                .execute()
-            )
-        except HttpError as e2:
-            st.error(f"❌ Google Drive upload failed: {e2}")
-            return None
-        except Exception as e2:
-            st.error(f"❌ Unexpected error while uploading to Drive: {e2}")
-            return None
-    except HttpError as e:
-        st.error(f"❌ Google Drive upload failed: {e}")
-        return None
-    except Exception as e:
-        st.error(f"❌ Unexpected error while uploading to Drive: {e}")
-        return None
-
-    upload_bar.progress(1.0)
-    return response.get("id") if response else None
-
 
 # ------------------ DEEPGRAM (AUDIO → TEXT) ------------------
 
@@ -252,7 +103,6 @@ def encode_upload_to_data_url(uploaded_file):
     """
     uploaded_file.seek(0)
     img = Image.open(uploaded_file).convert("RGB")
-    # Slight downscale to keep under Groq 4MB base64 limit
     max_side = 1280
     w, h = img.size
     if max(w, h) > max_side:
@@ -437,7 +287,6 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     OpenCV + FFmpeg: images -> video frames -> merge with audio.
     Shows percentage progress, respects stop flag.
     """
-    # Extra safety: empty timeline -> quick fallback
     if not timeline:
         image_names = list(image_map.keys())
         if not image_names:
@@ -458,7 +307,6 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     progress_bar = st.progress(0)
     percent_text = st.empty()
 
-    # total_sec calculation with float safety
     total_sec = 0.0
     for t in timeline:
         if isinstance(t, dict):
@@ -535,7 +383,7 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
 st.title("🤖 Free AI Video Generator (Groq)")
 st.markdown(
     "Stack: **Deepgram** (audio) + **Groq Llama 4 Scout** (vision) + "
-    "**Llama 3.1 8B** (logic) + **OpenCV** (render) + **Google Drive** (backup)"
+    "**Llama 3.1 8B** (logic) + **OpenCV** (render)"
 )
 
 col1, col2 = st.columns(2)
@@ -549,25 +397,14 @@ with col2:
 st.button("🛑 Stop processing", on_click=request_stop)
 
 if st.button("🚀 Generate video", type="primary"):
-    st.session_state.stop_requested = False  # reset flag at start
+    st.session_state.stop_requested = False  # reset flag
 
     if not audio_file or not uploaded_images:
         st.error("Please upload both audio and images first.")
     else:
         status = st.status("Starting process...", expanded=True)
 
-        # 1. Drive setup
-        status.write("📂 Setting up Google Drive...")
-        service = get_drive_service()
-        final_folder_id = get_or_create_subfolder(
-            service, "AI_Final_Videos", ROOT_FOLDER_ID
-        )
-
-        if st.session_state.stop_requested:
-            st.warning("⛔ Processing stopped by user.")
-            st.stop()
-
-        # 2. Save audio
+        # 1. Save audio
         status.write("💾 Saving audio file...")
         local_audio = os.path.join(TEMP_DIR, "input.mp3")
         with open(local_audio, "wb") as f:
@@ -577,7 +414,7 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Processing stopped by user.")
             st.stop()
 
-        # 3. Transcribe
+        # 2. Transcribe
         status.write("👂 Transcribing audio with Deepgram...")
         transcript = get_transcript(local_audio)
         if not transcript:
@@ -590,7 +427,7 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Processing stopped by user.")
             st.stop()
 
-        # 4. Analyze images (Groq vision)
+        # 3. Analyze images (Groq vision)
         status.write("👁️ Analyzing images with Groq Vision...")
         image_desc_map = analyze_images_with_groq(uploaded_images)
 
@@ -598,7 +435,7 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Processing stopped by user.")
             st.stop()
 
-        # 5. Plan scenes (Groq text)
+        # 4. Plan scenes (Groq text)
         status.write("🧠 Planning scenes with Groq Text...")
         plan = create_sync_plan_with_groq(full_text, image_desc_map)
 
@@ -616,7 +453,7 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Processing stopped by user.")
             st.stop()
 
-        # 6. Render
+        # 5. Render
         status.write("🎬 Rendering video with OpenCV...")
         image_map = {img.name: img for img in uploaded_images}
         final_vid_path = render_video(plan, local_audio, image_map)
@@ -625,18 +462,19 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Processing stopped before completion.")
             st.stop()
 
-        # 7. Upload
-        status.write("☁️ Uploading final video to Google Drive...")
-        file_id = upload_to_drive(final_vid_path, "AI_Gen_Video.mp4", final_folder_id)
+        status.update(label="✅ Video rendered!", state="complete", expanded=False)
+        st.success("Video rendered! You can watch or download it below.")
 
-        if not file_id:
-            status.update(
-                label="⚠️ Video rendered, but upload failed. Check error above.",
-                state="error",
-                expanded=False,
-            )
-        else:
-            status.update(label="✅ Video completed!", state="complete", expanded=False)
-            st.success(f"Video saved to Google Drive! File ID: {file_id}")
-
+        # Play in app
         st.video(final_vid_path)
+
+        # Download button
+        with open(final_vid_path, "rb") as f:
+            video_bytes = f.read()
+
+        st.download_button(
+            "⬇️ Download video",
+            data=video_bytes,
+            file_name="AI_Gen_Video.mp4",
+            mime="video/mp4",
+        )
