@@ -1,0 +1,6 @@
+.streamlit/
+secrets.toml
+*.mp4
+*.mp3
+temp_processing/
+__pycache__/
