@@ -46,6 +46,36 @@ if os.path.exists(TEMP_DIR):
     shutil.rmtree(TEMP_DIR)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+# ------------------ UTILS ------------------
+
+
+def get_audio_duration(audio_path: str):
+    """
+    ffprobe se audio ki duration (seconds) nikal lo.
+    Agar ffprobe na chale to None return karega.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                audio_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return None
+
+
 # ------------------ DEEPGRAM (AUDIO → TEXT) ------------------
 
 
@@ -192,7 +222,7 @@ def analyze_images_with_groq(image_files):
 def create_sync_plan_with_groq(script_text, image_desc_map):
     """
     Groq text model se JSON timeline (image + duration).
-    Always returns: list[ {image, duration_seconds: float} ]
+    Raw shape ko normalize_clean_plan() me further clean karein.
     """
     if not image_desc_map:
         return []
@@ -240,27 +270,62 @@ Rules:
         st.warning(f"⚠️ Groq planning failed, using fallback slideshow. Error: {e}")
         return []
 
-    # --- normalize shape ---
-    if isinstance(data, list):
-        raw_timeline = data
-    elif isinstance(data, dict):
-        if "timeline" in data and isinstance(data["timeline"], list):
-            raw_timeline = data["timeline"]
-        elif "scenes" in data and isinstance(data["scenes"], list):
-            raw_timeline = data["scenes"]
-        else:
-            raw_timeline = data.get("items", [])
-            if not isinstance(raw_timeline, list):
-                raw_timeline = []
-    else:
-        raw_timeline = []
+    return data
 
-    normalized = []
-    for entry in raw_timeline:
+
+def build_slideshow_timeline(valid_image_names, audio_duration=None, script_text=None):
+    """
+    Simple fallback: har image ko equal duration.
+    """
+    if not valid_image_names:
+        return []
+
+    if audio_duration and audio_duration > 1:
+        dur = audio_duration / len(valid_image_names)
+    else:
+        # crude estimation based on script length
+        words = len(script_text.split()) if script_text else 120
+        total_guess = max(words / 2.4, 30)  # ~2.4 wps, min 30s
+        dur = total_guess / len(valid_image_names)
+
+    dur = max(dur, 1.0)  # at least 1 second per image
+    return [{"image": name, "duration_seconds": float(dur)} for name in valid_image_names]
+
+
+def normalize_and_scale_timeline(
+    raw_plan, valid_image_names, audio_duration=None, script_text=None
+):
+    """
+    - Raw Groq plan ko clean karo.
+    - Sirf valid filenames rakho.
+    - Durations ko float + positive banao.
+    - Phir total ko audio_duration se match karne ke liye scale karo.
+    """
+    valid_set = set(valid_image_names)
+    if not valid_set:
+        return []
+
+    # 1) Raw shape -> list of dicts
+    if isinstance(raw_plan, list):
+        raw_list = raw_plan
+    elif isinstance(raw_plan, dict):
+        if "timeline" in raw_plan and isinstance(raw_plan["timeline"], list):
+            raw_list = raw_plan["timeline"]
+        elif "scenes" in raw_plan and isinstance(raw_plan["scenes"], list):
+            raw_list = raw_plan["scenes"]
+        else:
+            raw_list = raw_plan.get("items", [])
+            if not isinstance(raw_list, list):
+                raw_list = []
+    else:
+        raw_list = []
+
+    cleaned = []
+    for entry in raw_list:
         if not isinstance(entry, dict):
             continue
         img = entry.get("image") or entry.get("filename")
-        if not img:
+        if not img or img not in valid_set:
             continue
         dur = (
             entry.get("duration_seconds")
@@ -274,9 +339,21 @@ Rules:
             dur = 5.0
         if dur <= 0:
             dur = 5.0
-        normalized.append({"image": img, "duration_seconds": dur})
+        cleaned.append({"image": img, "duration_seconds": dur})
 
-    return normalized
+    # Agar sab filter ho gaye / kuch bhi nahi bacha:
+    if not cleaned:
+        return build_slideshow_timeline(valid_image_names, audio_duration, script_text)
+
+    # 2) Audio length se match karne ke liye scale
+    if audio_duration and audio_duration > 5:
+        total_planned = sum(max(c["duration_seconds"], 0.1) for c in cleaned)
+        if total_planned > 0:
+            scale = audio_duration / total_planned
+            for c in cleaned:
+                c["duration_seconds"] = max(c["duration_seconds"] * scale, 0.5)
+
+    return cleaned
 
 
 # ------------------ VIDEO RENDERING ------------------
@@ -410,6 +487,8 @@ if st.button("🚀 Generate video", type="primary"):
         with open(local_audio, "wb") as f:
             f.write(audio_file.getbuffer())
 
+        audio_duration = get_audio_duration(local_audio)
+
         if st.session_state.stop_requested:
             st.warning("⛔ Processing stopped by user.")
             st.stop()
@@ -437,17 +516,21 @@ if st.button("🚀 Generate video", type="primary"):
 
         # 4. Plan scenes (Groq text)
         status.write("🧠 Planning scenes with Groq Text...")
-        plan = create_sync_plan_with_groq(full_text, image_desc_map)
+        raw_plan = create_sync_plan_with_groq(full_text, image_desc_map)
+
+        valid_image_names = [img.name for img in uploaded_images]
+        plan = normalize_and_scale_timeline(
+            raw_plan,
+            valid_image_names,
+            audio_duration=audio_duration,
+            script_text=full_text,
+        )
 
         if not plan:
-            status.write("⚠️ AI plan failed or quotas hit, using simple slideshow.")
-            image_names = [img.name for img in uploaded_images]
-            avg_dur = 5.0
-            try:
-                avg_dur = max(len(full_text.split()) / 2.5 / len(image_names), 1.0)
-            except Exception:
-                pass
-            plan = [{"image": name, "duration_seconds": avg_dur} for name in image_names]
+            status.write("⚠️ AI plan empty, using simple slideshow.")
+            plan = build_slideshow_timeline(
+                valid_image_names, audio_duration, script_text=full_text
+            )
 
         if st.session_state.stop_requested:
             st.warning("⛔ Processing stopped by user.")
@@ -463,7 +546,10 @@ if st.button("🚀 Generate video", type="primary"):
             st.stop()
 
         status.update(label="✅ Video rendered!", state="complete", expanded=False)
-        st.success("Video rendered! You can watch or download it below.")
+        if audio_duration:
+            st.success(f"Video rendered! (audio ≈ {int(audio_duration)} seconds)")
+        else:
+            st.success("Video rendered! You can watch or download it below.")
 
         # Play in app
         st.video(final_vid_path)
