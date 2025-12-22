@@ -1,7 +1,7 @@
 import streamlit as st
 import cv2
 import numpy as np
-import google.generativeai as genai
+from groq import Groq
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2 import service_account
@@ -11,15 +11,17 @@ import subprocess
 import os
 import shutil
 import time
-import requests  # Deepgram REST API
+import requests
+import base64
+from io import BytesIO
 
 # ------------------ CONFIG & GLOBALS ------------------
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-st.set_page_config(page_title="AI Video Generator", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="AI Video Generator (Groq)", page_icon="🎬", layout="wide")
 
-# simple state flag for stopping
+# stop flag
 if "stop_requested" not in st.session_state:
     st.session_state.stop_requested = False
 
@@ -32,15 +34,18 @@ def request_stop():
 
 try:
     DEEPGRAM_KEY = st.secrets["DEEPGRAM_API_KEY"]
-    GEMINI_KEY = st.secrets["GEMINI_API_KEY"]
+    GROQ_KEY = st.secrets["GROQ_API_KEY"]
     GCP_CREDS = st.secrets["gcp_service_account"]
     ROOT_FOLDER_ID = st.secrets["ROOT_FOLDER_ID"]
 except Exception:
     st.error(
-        "🚨 Secrets missing! Please configure DEEPGRAM_API_KEY, GEMINI_API_KEY, "
+        "🚨 Secrets missing! Please configure DEEPGRAM_API_KEY, GROQ_API_KEY, "
         "ROOT_FOLDER_ID and [gcp_service_account] in secrets."
     )
     st.stop()
+
+# Groq client
+groq_client = Groq(api_key=GROQ_KEY)
 
 # ------------- TEMP DIR -------------
 
@@ -145,7 +150,7 @@ def get_transcript(audio_path):
     }
 
     params = {
-        "model": "nova-2",  # ya "nova-3" agar account support kare
+        "model": "nova-2",
         "smart_format": "true",
     }
 
@@ -178,85 +183,119 @@ def get_transcript(audio_path):
     return [{"text": text, "start": start, "end": end}]
 
 
-# ------------------ GEMINI VISION (IMAGE DESCRIPTIONS) ------------------
+# ------------------ GROQ VISION HELPERS ------------------
 
 
-def analyze_images_batch(image_files):
+def encode_upload_to_data_url(uploaded_file):
     """
-    Gemini Vision se batched image descriptions.
-    Up to 5 images per call, rate-limit friendly.
+    UploadedFile -> resized JPEG -> base64 data URL (<=4MB target).
     """
-    genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    uploaded_file.seek(0)
+    img = Image.open(uploaded_file).convert("RGB")
+    # Slight downscale to keep under Groq 4MB base64 limit
+    max_side = 1280
+    w, h = img.size
+    if max(w, h) > max_side:
+        scale = max_side / float(max(w, h))
+        img = img.resize((int(w * scale), int(h * scale)))
+
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def analyze_images_with_groq(image_files):
+    """
+    Groq vision (Llama 4 Scout) se image descriptions.
+    Max 5 images per request, isliye batching.
+    Returns: dict {filename: description}
+    """
+    if not image_files:
+        return {}
+
+    model_id = "meta-llama/llama-4-scout-17b-16e-instruct"
 
     descriptions = {}
     batch_size = 5
-    total_images = len(image_files)
-
-    if total_images == 0:
-        return descriptions
-
-    progress_bar = st.progress(0)
+    total = len(image_files)
+    progress = st.progress(0)
     status = st.empty()
 
-    img_list = [(img.name, img) for img in image_files]
-
-    for i in range(0, total_images, batch_size):
+    for i in range(0, total, batch_size):
         if st.session_state.stop_requested:
             st.warning("⛔ Processing stopped by user during image analysis.")
-            return descriptions
-
-        batch = img_list[i : i + batch_size]
-        status.text(
-            f"👁️ Analyzing images {i+1} to {min(i+batch_size, total_images)}..."
-        )
-
-        inputs = [
-            "Describe each image briefly with its filename. "
-            "Format exactly as: Filename: Description"
-        ]
-
-        for name, file_obj in batch:
-            file_obj.seek(0)
-            img = Image.open(file_obj)
-            inputs.append(f"Filename: {name}")
-            inputs.append(img)
-
-        try:
-            response = model.generate_content(inputs)
-            descriptions[f"Batch_{i}"] = response.text
-            time.sleep(10)
-        except Exception as e:
-            # 429 ya koi bhi error ho -> warn + break, baaki slideshow use hoga
-            st.warning(f"Batch {i} failed: {e}")
             break
 
-        progress_bar.progress(min((i + batch_size) / total_images, 1.0))
+        batch = image_files[i : i + batch_size]
+        status.text(f"👁️ Analyzing images {i+1} to {min(i+batch_size, total)} with Groq...")
+
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    "You will receive several images. For each image, you will see a "
+                    "filename text like 'Filename: xyz.jpg' followed by the image. "
+                    "Return ONLY JSON in this format:\n"
+                    '{ "images": [ { "filename": "file1.jpg", "description": "..." }, '
+                    '{ "filename": "file2.png", "description": "..." } ] }'
+                ),
+            }
+        ]
+
+        for uf in batch:
+            data_url = encode_upload_to_data_url(uf)
+            content.append({"type": "text", "text": f"Filename: {uf.name}"})
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url},
+                }
+            )
+
+        try:
+            resp = groq_client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "user", "content": content}],
+                response_format={"type": "json_object"},
+                max_completion_tokens=1024,
+            )
+            text = resp.choices[0].message.content or "{}"
+            data = json.loads(text)
+            for item in data.get("images", []):
+                fn = item.get("filename")
+                desc = item.get("description")
+                if fn and desc:
+                    descriptions[fn] = desc
+        except Exception as e:
+            st.warning(f"Groq vision batch failed, will fallback to slideshow. Error: {e}")
+            break
+
+        progress.progress(min((i + batch_size) / total, 1.0))
 
     return descriptions
 
 
-# ------------------ GEMINI LOGIC (TIMELINE PLAN) ------------------
+# ------------------ GROQ TEXT (TIMELINE PLAN) ------------------
 
 
-def create_sync_plan(script_text, image_descriptions_dict):
+def create_sync_plan_with_groq(script_text, image_desc_map):
     """
-    Gemini se JSON timeline banwana: image + duration.
+    Groq text model se JSON timeline (image + duration).
     """
-    if not image_descriptions_dict:
-        return []  # direct fallback
+    if not image_desc_map:
+        return []
 
-    genai.configure(api_key=GEMINI_KEY)
-    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    model_id = "llama-3.1-8b-instant"
 
-    desc_text = json.dumps(image_descriptions_dict)
+    desc_json = json.dumps(image_desc_map)
 
     prompt = f"""
 SCRIPT:
 \"\"\"{script_text}\"\"\"
 
-IMAGE_DESCRIPTIONS_JSON:
-{desc_text}
+IMAGE_DESCRIPTIONS (JSON mapping filename -> description):
+{desc_json}
 
 TASK:
 Create a JSON timeline that maps images to the script based on context.
@@ -275,11 +314,17 @@ Rules:
 """
 
     try:
-        response = model.generate_content(prompt)
-        clean_json = response.text.replace("```json", "").replace("```", "")
-        return json.loads(clean_json)
+        resp = groq_client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_completion_tokens=1024,
+            temperature=0.2,
+        )
+        text = resp.choices[0].message.content or "[]"
+        return json.loads(text)
     except Exception as e:
-        st.warning(f"⚠️ Plan creation failed, using fallback. Error: {e}")
+        st.warning(f"⚠️ Groq planning failed, using fallback slideshow. Error: {e}")
         return []
 
 
@@ -365,10 +410,10 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
 
 # ------------------ UI ------------------
 
-st.title("🤖 Free AI Video Generator")
+st.title("🤖 Free AI Video Generator (Groq)")
 st.markdown(
-    "Stack: **Deepgram** (audio) + **Gemini 2.0 Flash** (vision + logic) "
-    "+ **OpenCV** (render) + **Google Drive** (backup)"
+    "Stack: **Deepgram** (audio) + **Groq Llama 4 Scout** (vision) + "
+    "**Llama 3.1 8B** (logic) + **OpenCV** (render) + **Google Drive** (backup)"
 )
 
 col1, col2 = st.columns(2)
@@ -423,20 +468,20 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Processing stopped by user.")
             st.stop()
 
-        # 4. Analyze images
-        status.write("👁️ Analyzing images with Gemini Vision...")
-        image_desc = analyze_images_batch(uploaded_images)
+        # 4. Analyze images (Groq vision)
+        status.write("👁️ Analyzing images with Groq Vision...")
+        image_desc_map = analyze_images_with_groq(uploaded_images)
 
         if st.session_state.stop_requested:
             st.warning("⛔ Processing stopped by user.")
             st.stop()
 
-        # 5. Plan scenes
-        status.write("🧠 Planning scenes with Gemini Logic...")
-        plan = create_sync_plan(full_text, image_desc)
+        # 5. Plan scenes (Groq text)
+        status.write("🧠 Planning scenes with Groq Text...")
+        plan = create_sync_plan_with_groq(full_text, image_desc_map)
 
         if not plan:
-            status.write("⚠️ AI plan failed or Gemini quota ended, using simple slideshow.")
+            status.write("⚠️ AI plan failed or quotas hit, using simple slideshow.")
             image_names = [img.name for img in uploaded_images]
             avg_dur = 5.0
             try:
