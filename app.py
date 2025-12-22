@@ -4,6 +4,7 @@ import numpy as np
 from groq import Groq
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError, ResumableUploadError
 from google.oauth2 import service_account
 from PIL import Image
 import json
@@ -122,17 +123,76 @@ def get_or_create_subfolder(service, folder_name, parent_id):
 
 
 def upload_to_drive(file_path, file_name, folder_id):
+    """
+    Google Drive par video upload:
+    - Resumable upload with chunks
+    - Error par simple upload fallback
+    - Progress bar Streamlit me
+    """
     service = get_drive_service()
     file_metadata = {"name": file_name, "parents": [folder_id]}
-    media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
 
-    st.info(f"☁️ Uploading {file_name} to Google Drive...")
-    file = (
-        service.files()
-        .create(body=file_metadata, media_body=media, fields="id")
-        .execute()
+    # 5 MB chunks for resumable upload
+    chunk_size = 5 * 1024 * 1024
+
+    media = MediaFileUpload(
+        file_path,
+        mimetype="video/mp4",
+        chunksize=chunk_size,
+        resumable=True,
     )
-    return file.get("id")
+
+    st.info(f"☁️ Uploading {file_name} to Google Drive (resumable)...")
+    request = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id",
+    )
+
+    response = None
+    upload_bar = st.progress(0)
+    last_progress = 0
+
+    try:
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                prog = int(status.progress() * 100)
+                if prog != last_progress:
+                    upload_bar.progress(prog / 100.0)
+                    last_progress = prog
+    except ResumableUploadError as e:
+        # Resumable upload fail ho gaya – simple upload se retry
+        st.warning(
+            "⚠️ Resumable upload failed, trying a simpler upload instead.\n\n"
+            f"Details: {e}"
+        )
+        try:
+            media = MediaFileUpload(
+                file_path,
+                mimetype="video/mp4",
+                resumable=False,
+            )
+            response = (
+                service.files()
+                .create(body=file_metadata, media_body=media, fields="id")
+                .execute()
+            )
+        except HttpError as e2:
+            st.error(f"❌ Google Drive upload failed: {e2}")
+            return None
+        except Exception as e2:
+            st.error(f"❌ Unexpected error while uploading to Drive: {e2}")
+            return None
+    except HttpError as e:
+        st.error(f"❌ Google Drive upload failed: {e}")
+        return None
+    except Exception as e:
+        st.error(f"❌ Unexpected error while uploading to Drive: {e}")
+        return None
+
+    upload_bar.progress(1.0)
+    return response.get("id") if response else None
 
 
 # ------------------ DEEPGRAM (AUDIO → TEXT) ------------------
@@ -339,7 +399,6 @@ Rules:
         elif "scenes" in data and isinstance(data["scenes"], list):
             raw_timeline = data["scenes"]
         else:
-            # maybe directly {image:.., duration_seconds:..} ?
             raw_timeline = data.get("items", [])
             if not isinstance(raw_timeline, list):
                 raw_timeline = []
@@ -380,7 +439,6 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     """
     # Extra safety: empty timeline -> quick fallback
     if not timeline:
-        # simple 5 second slideshow
         image_names = list(image_map.keys())
         if not image_names:
             st.error("No images available for rendering.")
@@ -571,6 +629,14 @@ if st.button("🚀 Generate video", type="primary"):
         status.write("☁️ Uploading final video to Google Drive...")
         file_id = upload_to_drive(final_vid_path, "AI_Gen_Video.mp4", final_folder_id)
 
-        status.update(label="✅ Video completed!", state="complete", expanded=False)
-        st.success(f"Video saved to Google Drive! File ID: {file_id}")
+        if not file_id:
+            status.update(
+                label="⚠️ Video rendered, but upload failed. Check error above.",
+                state="error",
+                expanded=False,
+            )
+        else:
+            status.update(label="✅ Video completed!", state="complete", expanded=False)
+            st.success(f"Video saved to Google Drive! File ID: {file_id}")
+
         st.video(final_vid_path)
