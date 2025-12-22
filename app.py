@@ -28,7 +28,7 @@ def request_stop():
     st.session_state.stop_requested = True
 
 
-# ------------- LOAD SECRETS (Streamlit / secrets.toml) -------------
+# ------------- LOAD SECRETS -------------
 
 try:
     DEEPGRAM_KEY = st.secrets["DEEPGRAM_API_KEY"]
@@ -62,49 +62,58 @@ def get_drive_service():
 
 def get_or_create_subfolder(service, folder_name, parent_id):
     """
-    Given parent folder ID, uske andar ek subfolder lao ya banao.
-    Agar parent_id access na ho paya to gracefully service account ka "root"
-    use kar le, taake app crash na kare.
+    Try to use given parent_id. Agar access fail ho ya 404 aaye,
+    quietly service account ke root ('root') pe fallback kar do.
     """
-    original_parent = parent_id
+    effective_parent = parent_id
 
-    # Soft check: parent folder accessible?
+    def list_in_parent(pid):
+        q = (
+            "mimeType='application/vnd.google-apps.folder' "
+            f"and name='{folder_name}' and '{pid}' in parents and trashed=false"
+        )
+        return service.files().list(q=q, fields="files(id, name)").execute().get(
+            "files", []
+        )
+
+    # 1) Try LIST in given parent
     try:
-        service.files().get(fileId=parent_id, fields="id").execute()
+        files = list_in_parent(effective_parent)
     except Exception as e:
         st.warning(
             f"⚠️ Cannot access ROOT_FOLDER_ID='{parent_id}'. "
-            "Falling back to the service account root folder instead."
+            "Using the service account root folder instead."
         )
         st.write(e)
-        parent_id = "root"
-
-    query = (
-        "mimeType='application/vnd.google-apps.folder' "
-        f"and name='{folder_name}' and '{parent_id}' in parents and trashed=false"
-    )
-
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get("files", [])
+        effective_parent = "root"
+        files = list_in_parent(effective_parent)
 
     if files:
         return files[0]["id"]
 
+    # 2) Try CREATE in that parent. If create fail, retry in root.
     file_metadata = {
         "name": folder_name,
         "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
+        "parents": [effective_parent],
     }
 
-    folder = service.files().create(body=file_metadata, fields="id").execute()
-
-    if parent_id == "root" and original_parent != "root":
-        st.info(
-            "Created AI_Final_Videos in the service account root, "
-            "because the configured ROOT_FOLDER_ID was not accessible."
-        )
-
-    return folder["id"]
+    try:
+        folder = service.files().create(body=file_metadata, fields="id").execute()
+        return folder["id"]
+    except Exception as e:
+        if effective_parent != "root":
+            st.warning(
+                "⚠️ Could not create folder in custom ROOT_FOLDER_ID, "
+                "retrying in service account root."
+            )
+            file_metadata["parents"] = ["root"]
+            folder = service.files().create(body=file_metadata, fields="id").execute()
+            return folder["id"]
+        else:
+            st.error("❌ Drive error while creating folder.")
+            st.write(e)
+            raise
 
 
 def upload_to_drive(file_path, file_name, folder_id):
@@ -218,7 +227,9 @@ def analyze_images_batch(image_files):
             descriptions[f"Batch_{i}"] = response.text
             time.sleep(1.5)
         except Exception as e:
+            # 429 ya koi bhi error ho -> warn + break, baaki slideshow use hoga
             st.warning(f"Batch {i} failed: {e}")
+            break
 
         progress_bar.progress(min((i + batch_size) / total_images, 1.0))
 
@@ -232,6 +243,9 @@ def create_sync_plan(script_text, image_descriptions_dict):
     """
     Gemini se JSON timeline banwana: image + duration.
     """
+    if not image_descriptions_dict:
+        return []  # direct fallback
+
     genai.configure(api_key=GEMINI_KEY)
     model = genai.GenerativeModel("gemini-2.0-flash")
 
@@ -422,7 +436,7 @@ if st.button("🚀 Generate video", type="primary"):
         plan = create_sync_plan(full_text, image_desc)
 
         if not plan:
-            status.write("⚠️ AI plan failed, using simple slideshow.")
+            status.write("⚠️ AI plan failed or Gemini quota ended, using simple slideshow.")
             image_names = [img.name for img in uploaded_images]
             avg_dur = 5.0
             try:
