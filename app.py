@@ -84,10 +84,10 @@ def get_audio_duration(audio_path: str):
 
 def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
     """
-    Deepgram REST API se:
-    - full transcript text
-    - word-level timestamps
-    - un words ko small chunks (sentences/segments) me group karna
+    Deepgram:
+    - full transcript
+    - word timestamps
+    - un words ko chunks (sentences / segments) me group karein.
 
     Return:
         full_text (str),
@@ -133,7 +133,6 @@ def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
     words = alt.get("words", [])
 
     if not words:
-        # koi words nahi → ek big chunk (0 → audio_duration)
         if not audio_duration:
             return full_text, []
         return full_text, [
@@ -157,7 +156,6 @@ def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
 
         gap = start - prev_end
 
-        # naya chunk agar gap zyada hai
         if gap > max_gap and current_words:
             chunk_text = " ".join(current_words).strip()
             chunks.append(
@@ -186,12 +184,10 @@ def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
             }
         )
 
-    # last chunk ko slightly adjust kar do agar audio_duration pata ho
     if audio_duration and chunks:
         if chunks[-1]["end"] > audio_duration + 0.3:
             chunks[-1]["end"] = float(audio_duration)
         elif chunks[-1]["end"] < audio_duration - 0.5:
-            # thoda extend kar do
             chunks[-1]["end"] = float(audio_duration)
 
     return full_text, chunks
@@ -201,9 +197,6 @@ def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
 
 
 def encode_upload_to_data_url(uploaded_file):
-    """
-    UploadedFile -> resized JPEG -> base64 data URL (<=4MB target).
-    """
     uploaded_file.seek(0)
     img = Image.open(uploaded_file).convert("RGB")
     max_side = 1280
@@ -219,11 +212,6 @@ def encode_upload_to_data_url(uploaded_file):
 
 
 def analyze_images_with_groq(image_files):
-    """
-    Groq vision (Llama 4 Scout) se image descriptions.
-    Max 5 images per request, batching.
-    Returns: dict {filename: description}
-    """
     if not image_files:
         return {}
 
@@ -293,24 +281,11 @@ def analyze_images_with_groq(image_files):
 
 
 def map_chunks_to_images_groq(chunks, image_desc_map, image_names):
-    """
-    Groq text model:
-    - chunks: [{index, text, start, end}, ...]
-    - image_desc_map: {filename: description}
-    - image_names: actual filenames (for safety)
-
-    Returns:
-        mappings = [
-          {"chunk_index": 1, "image": "some_file.jpg"},
-          ...
-        ]
-    """
     if not chunks or not image_names:
         return []
 
     model_id = "llama-3.1-8b-instant"
 
-    # Keep text short to avoid huge prompt
     chunks_brief = []
     for c in chunks:
         text = c["text"]
@@ -393,12 +368,6 @@ RULES:
 def build_timeline_from_chunks(
     chunks, mappings, image_names, audio_duration=None, min_dur=0.5
 ):
-    """
-    - chunk durations Deepgram ke timestamps se (end - start)
-    - Groq mapping se har chunk ko image assign
-    - Agar mapping missing/invalid → fallback sequential mapping
-    - Total ko audio_duration ke hisaab se scale karte hain
-    """
     if not chunks or not image_names:
         return []
 
@@ -411,17 +380,15 @@ def build_timeline_from_chunks(
                 idx_to_img[idx] = img
 
     timeline = []
-    for i, chunk in enumerate(chunks):
+    for chunk in chunks:
         dur = max(chunk["end"] - chunk["start"], min_dur)
         idx = chunk["index"]
         img = idx_to_img.get(idx)
         if not img:
-            # fallback: sequential assignment
             img = image_names[(idx - 1) % len(image_names)]
 
         timeline.append({"image": img, "duration_seconds": float(dur)})
 
-    # Scale durations to match audio duration (optional but nice)
     if audio_duration and audio_duration > 5:
         total_planned = sum(max(t["duration_seconds"], 0.1) for t in timeline)
         if total_planned > 0:
@@ -433,9 +400,6 @@ def build_timeline_from_chunks(
 
 
 def build_equal_slideshow(image_names, audio_duration=None):
-    """
-    Simple fallback: equal time per image.
-    """
     if not image_names:
         return []
 
@@ -454,6 +418,7 @@ def build_equal_slideshow(image_names, audio_duration=None):
 def render_video(timeline, audio_path, image_map, output_name="final_video.mp4"):
     """
     OpenCV + FFmpeg: images -> video frames -> merge with audio.
+    Yahan FFmpeg ka output check kar rahe hain, file size bhi check kar rahe hain.
     """
     if not timeline:
         st.error("No timeline provided.")
@@ -503,7 +468,6 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
                 out.release()
                 return None
 
-            # light zoom effect
             scale = 1.0 + (0.05 * i / frames_in_clip)
             M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
             zoomed = cv2.warpAffine(img, M, (width, height))
@@ -522,12 +486,43 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
         st.warning("⛔ Processing stopped before audio merge.")
         return None
 
-    st.write("🎵 Merging audio with video...")
-    command = (
-        f'ffmpeg -y -i "{temp_video}" -i "{audio_path}" '
-        f'-c:v copy -c:a aac -shortest "{final_output}"'
+    st.write("🎵 Merging audio with video (FFmpeg)...")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        temp_video,
+        "-i",
+        audio_path,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-shortest",
+        final_output,
+    ]
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
-    subprocess.run(command, shell=True)
+
+    if result.returncode != 0:
+        st.error("❌ FFmpeg failed while merging audio and video.")
+        st.code(result.stdout[-2000:])
+        return None
+
+    # file existence + size check
+    if not os.path.exists(final_output):
+        st.error("❌ Final video file was not created.")
+        st.code(result.stdout[-2000:])
+        return None
+
+    if os.path.getsize(final_output) < 1024:  # <1KB => probably broken
+        st.error("❌ Final video seems too small / corrupted.")
+        st.code(result.stdout[-2000:])
+        return None
 
     return final_output
 
@@ -577,7 +572,9 @@ if st.button("🚀 Generate video", type="primary"):
 
         # 2. Deepgram chunks
         status.write("👂 Getting transcript + timestamps (Deepgram)...")
-        full_text, chunks = get_transcript_chunks(local_audio, audio_duration=audio_duration)
+        full_text, chunks = get_transcript_chunks(
+            local_audio, audio_duration=audio_duration
+        )
 
         if not chunks:
             status.write("⚠️ No chunks from Deepgram, using equal slideshow.")
@@ -596,7 +593,9 @@ if st.button("🚀 Generate video", type="primary"):
 
             # 4. Chunk → image mapping
             status.write("🧠 Mapping chunks to images with Groq Text...")
-            mappings = map_chunks_to_images_groq(chunks, image_desc_map, valid_image_names)
+            mappings = map_chunks_to_images_groq(
+                chunks, image_desc_map, valid_image_names
+            )
 
             # 5. Build final timeline
             status.write("🧩 Building final timeline...")
@@ -621,7 +620,7 @@ if st.button("🚀 Generate video", type="primary"):
         final_vid_path = render_video(plan, local_audio, image_map)
 
         if final_vid_path is None or st.session_state.stop_requested:
-            st.warning("⛔ Processing stopped before completion.")
+            st.warning("⛔ Processing stopped before completion or video failed to render.")
             st.stop()
 
         status.update(label="✅ Video rendered!", state="complete", expanded=False)
@@ -630,10 +629,15 @@ if st.button("🚀 Generate video", type="primary"):
         else:
             st.success("Video rendered! You can watch or download it below.")
 
-        st.video(final_vid_path)
+        # IMPORTANT: read bytes instead of passing path directly
+        try:
+            with open(final_vid_path, "rb") as f:
+                video_bytes = f.read()
+        except Exception as e:
+            st.error(f"❌ Could not read final video file: {e}")
+            st.stop()
 
-        with open(final_vid_path, "rb") as f:
-            video_bytes = f.read()
+        st.video(video_bytes)
 
         st.download_button(
             "⬇️ Download video",
