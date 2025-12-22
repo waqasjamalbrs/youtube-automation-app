@@ -225,7 +225,7 @@ def analyze_images_batch(image_files):
         try:
             response = model.generate_content(inputs)
             descriptions[f"Batch_{i}"] = response.text
-            time.sleep(1.5)
+            time.sleep(5)
         except Exception as e:
             # 429 ya koi bhi error ho -> warn + break, baaki slideshow use hoga
             st.warning(f"Batch {i} failed: {e}")
