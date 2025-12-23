@@ -386,7 +386,7 @@ Rules:
             if pmt:
                 prompts_map[idx] = pmt
 
-    # Strictness: har chunk k liye prompt required (no silent fallback)
+    # Strict: har chunk k liye prompt required
     expected_indexes = {c["index"] for c in chunks}
     missing = sorted(list(expected_indexes - set(prompts_map.keys())))
     if missing:
@@ -418,7 +418,6 @@ def generate_image_from_prompt(prompt, aspect_ratio, mode_label, api_key, timeou
     payload = {
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
-        # "provider" field sirf mode_label ki value use karega
         "provider": mode_label,
         "n": 1,
     }
@@ -595,16 +594,6 @@ def render_video_from_scenes(scenes, audio_path, output_name="final_video.mp4"):
 # =========================
 
 if "scenes" not in st.session_state:
-    # Each scene:
-    # {
-    #   "index": int,
-    #   "start": float,
-    #   "end": float,
-    #   "text": str,
-    #   "prompt": str,
-    #   "image_name": str or None,
-    #   "image_data": bytes or None
-    # }
     st.session_state.scenes = []
 
 if "audio_path" not in st.session_state:
@@ -620,7 +609,7 @@ if "prompt_raw" not in st.session_state:
     st.session_state.prompt_raw = None
 
 # =========================
-# SIDEBAR SETTINGS (NO BRAND NAMES)
+# SIDEBAR SETTINGS
 # =========================
 
 with st.sidebar:
@@ -803,7 +792,7 @@ if scenes:
             except Exception as e:
                 st.error(f"Scene {sc['index']} image error: {e}")
         st.session_state.scenes = scenes
-        st.experimental_rerun()
+        st.rerun()
 
     st.divider()
 
@@ -855,7 +844,7 @@ if scenes:
                             sc["image_name"] = fname
                             sc["image_data"] = data
                             st.session_state.scenes = scenes
-                            st.experimental_rerun()
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Image error (scene {idx}): {e}")
 
@@ -891,7 +880,7 @@ if scenes:
             "Har scene k liye image generate karo before rendering."
         )
 
-    # Compact table-like review with edit/regenerate again (same state share hoga)
+    # Compact review with edit/regenerate again
     for sc in scenes:
         idx = sc["index"]
         start = sc["start"]
@@ -901,17 +890,17 @@ if scenes:
             st.write("**Voiceover text:**")
             st.write(sc["text"])
 
-            # same prompt key reuse
             prompt_key = f"scene_prompt_{idx}"
-            new_prompt = st.text_area(
+
+            new_prompt_final = st.text_area(
                 "Final prompt (you can still edit)",
                 key=prompt_key + "_final",
-                value=st.session_state.get(prompt_key, sc["prompt"]),
+                value=sc["prompt"],
                 height=80,
             )
-            # Update both original + final references
-            st.session_state[prompt_key] = new_prompt
-            sc["prompt"] = new_prompt
+
+            # final prompt bhi scene obj me update
+            sc["prompt"] = new_prompt_final
 
             col1, col2 = st.columns([1, 2])
             with col1:
@@ -929,7 +918,7 @@ if scenes:
                             sc["image_name"] = fname
                             sc["image_data"] = data
                             st.session_state.scenes = scenes
-                            st.experimental_rerun()
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Image error (scene {idx}): {e}")
 
