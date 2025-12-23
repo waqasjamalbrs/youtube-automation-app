@@ -669,15 +669,6 @@ with st.sidebar:
 st.title("🎬 AI Video Generator")
 
 st.markdown(
-    """
-**Flow:**
-
-1. Voiceover se transcript + timestamps + scenes  
-2. Har scene ke liye automatic image prompts  
-3. Har scene ka prompt edit + image generate / regenerate  
-4. Final review screen: voiceover text + prompt + image  
-5. Jab tum confirm karo, tab video render (timestamps = 100% sync)  
-"""
 )
 
 audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
