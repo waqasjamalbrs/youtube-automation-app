@@ -77,7 +77,7 @@ TEMP_DIR = BASE_TEMP_DIR
 
 
 def clean_temp_dir():
-    """Har run se pehle temp dir ke andar ki purani files clean kar do."""
+    """Clean old files inside the temp directory before each run."""
     if not os.path.exists(TEMP_DIR):
         os.makedirs(TEMP_DIR, exist_ok=True)
         return
@@ -107,7 +107,7 @@ def safe_name(s: str, max_len: int = 60) -> str:
 
 
 def get_audio_duration(audio_path: str):
-    """ffprobe se audio ki duration (seconds) nikal lo."""
+    """Get audio duration (seconds) using ffprobe."""
     try:
         result = subprocess.run(
             [
@@ -172,10 +172,10 @@ def get_transcript_chunks(
     Transcription API:
     - full transcript
     - word timestamps
-    - words ko chunks (segments) me todta hai:
-        - agar words ke beech bohot gap ho (silence)
-        - YA words count zyada ho jaye
-        - YA chunk ki duration bohot badi ho jaye
+    - splits words into chunks (segments):
+        - if there is a large silence gap
+        - OR too many words
+        - OR chunk duration exceeds max_chunk_duration
 
     Return:
         full_text (str),
@@ -276,8 +276,8 @@ def get_transcript_chunks(
             }
         )
 
+    # Align last chunk to audio end if needed
     if audio_duration and chunks:
-        # last chunk ko audio ke end ke sath align rakhna
         if chunks[-1]["end"] > audio_duration + 0.3:
             chunks[-1]["end"] = float(audio_duration)
         elif chunks[-1]["end"] < audio_duration - 0.5:
@@ -292,17 +292,14 @@ def get_transcript_chunks(
 
 def generate_image_prompts_for_chunks(chunks):
     """
-    Har chunk ke liye ek image-generation prompt.
-    Model se output **plain text** me lenge, JSON nahi.
-    Format jo hum expect kar rahe hain:
+    For each chunk, generate an image prompt using a text model.
+    Model output is plain text, not JSON.
+
+    Expected format:
 
       Scene 1: cinematic prompt...
       Scene 2: another prompt...
       Scene 3: ...
-
-    Return:
-        prompts_map: {chunk_index: prompt_str}
-        raw_text: str (model ka raw response)
     """
     if not chunks:
         return {}, None
@@ -386,7 +383,7 @@ Rules:
             if pmt:
                 prompts_map[idx] = pmt
 
-    # Strict: har chunk k liye prompt required
+    # Strict: every chunk must have a prompt
     expected_indexes = {c["index"] for c in chunks}
     missing = sorted(list(expected_indexes - set(prompts_map.keys())))
     if missing:
@@ -457,6 +454,7 @@ def render_video_from_scenes(
     audio_path,
     color_mode="Color",
     zoom_strength=0.05,
+    audio_duration=None,
     output_name="final_video.mp4",
 ):
     """
@@ -473,7 +471,7 @@ def render_video_from_scenes(
 
     Sync:
         - duration = end - start (no rescaling, no fallback)
-        - 100% timestamps-based
+        - strict frame counts based on durations
     """
     if not scenes:
         st.error("No scenes to render.")
@@ -486,6 +484,22 @@ def render_video_from_scenes(
 
     width, height = 854, 480
     fps = 24
+
+    # Precompute durations and frames per scene
+    durations = [max(float(sc["end"] - sc["start"]), 0.2) for sc in scenes]
+    frames_per_scene = [max(int(round(d * fps)), 1) for d in durations]
+
+    # Target total frames based on audio duration (if available)
+    if audio_duration is not None and audio_duration > 0:
+        total_frames_target = max(int(round(audio_duration * fps)), 1)
+    else:
+        total_frames_target = sum(frames_per_scene)
+
+    # Adjust last scene frames to match total target (to avoid cumulative drift)
+    current_sum = sum(frames_per_scene)
+    diff = total_frames_target - current_sum
+    if diff != 0:
+        frames_per_scene[-1] = max(frames_per_scene[-1] + diff, 1)
 
     temp_video = os.path.join(TEMP_DIR, "temp_silent.mp4")
     final_output = os.path.join(TEMP_DIR, output_name)
@@ -501,19 +515,17 @@ def render_video_from_scenes(
     progress_bar = st.progress(0)
     percent_text = st.empty()
 
-    total_sec = sum(max(sc["end"] - sc["start"], 0.1) for sc in scenes)
-    total_frames_all = max(int(total_sec * fps), 1)
+    total_frames_all = sum(frames_per_scene)
     current_frame = 0
 
-    for sc in scenes:
+    for sc, frames_in_clip, duration in zip(scenes, frames_per_scene, durations):
         if st.session_state.stop_requested:
             st.warning("⛔ Stopped during rendering.")
             out.release()
             return None
 
-        duration = max(float(sc["end"] - sc["start"]), 0.2)
         img_bytes = sc["image_data"]
-        if not img_bytes:
+        if not img_bytes or frames_in_clip <= 0:
             continue
 
         file_bytes = np.asarray(bytearray(img_bytes), dtype=np.uint8)
@@ -522,7 +534,6 @@ def render_video_from_scenes(
             continue
 
         img = cv2.resize(img, (width, height))
-        frames_in_clip = max(int(duration * fps), 1)
 
         for i in range(frames_in_clip):
             if st.session_state.stop_requested:
@@ -530,8 +541,8 @@ def render_video_from_scenes(
                 out.release()
                 return None
 
-            # zoom_strength slider se control
-            scale = 1.0 + (zoom_strength * i / frames_in_clip)
+            # zoom_strength slider controls zoom-in effect
+            scale = 1.0 + (zoom_strength * i / max(frames_in_clip - 1, 1))
             M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
             frame = cv2.warpAffine(img, M, (width, height))
 
@@ -643,7 +654,7 @@ with st.sidebar:
 
     timeout = st.slider("Image request timeout (seconds)", 10, 180, 60)
 
-    # NEW: video look settings
+    # Video look settings
     color_mode = st.radio(
         "Video color mode",
         ["Color", "Black & white"],
@@ -667,12 +678,6 @@ with st.sidebar:
 # =========================
 
 st.title("🎬 AI Video Generator")
-
-st.markdown(
-    """
-
-"""
-)
 
 audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
 
@@ -708,11 +713,11 @@ if analyze:
     status = st.status("Starting analysis...", expanded=True)
 
     # Clean temp
-    status.write("🧹 Cleaning temp folder...")
+    status.write("Cleaning temp folder...")
     clean_temp_dir()
 
     # Save audio
-    status.write("💾 Saving audio file...")
+    status.write("Saving audio file...")
     local_audio = os.path.join(TEMP_DIR, "input.mp3")
     local_audio = os.path.abspath(local_audio)
     with open(local_audio, "wb") as f:
@@ -727,14 +732,14 @@ if analyze:
     st.session_state.audio_duration = audio_duration
 
     if audio_duration:
-        status.write(f"⏱️ Audio duration: ~{audio_duration:.2f} seconds")
+        status.write(f"Audio duration: ~{audio_duration:.2f} seconds")
 
     if st.session_state.stop_requested:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
     # Transcription  (WITH 5s MAX CHUNKS)
-    status.write("👂 Getting transcript + timestamps...")
+    status.write("Getting transcript and timestamps...")
     full_text, chunks, raw = get_transcript_chunks(
         local_audio, audio_duration=audio_duration, max_chunk_duration=5.0
     )
@@ -749,7 +754,7 @@ if analyze:
         st.stop()
 
     # Text model: prompts
-    status.write("🧠 Generating image prompts for each scene...")
+    status.write("Generating image prompts for each scene...")
     prompts_map, prompt_raw = generate_image_prompts_for_chunks(chunks)
     st.session_state.prompt_raw = prompt_raw
 
@@ -786,10 +791,10 @@ scenes = st.session_state.scenes
 audio_path = st.session_state.audio_path
 
 if scenes:
-    st.subheader("2️⃣ Scene Prompts & Images (Editing)")
+    st.subheader("Scene Prompts & Images")
 
     st.caption(
-        "Har scene voiceover se linked hai. Prompt edit karo, phir image generate / regenerate karo."
+        "Each scene is linked to the voiceover. Edit prompts and generate/regenerate images for each scene."
     )
 
     # Bulk generate for scenes without image
@@ -888,18 +893,18 @@ if scenes:
     # FINAL REVIEW (VOICEOVER + PROMPT + IMAGE) BEFORE RENDER
     # =========================
 
-    st.subheader("3️⃣ Final Review (Text + Prompts + Images)")
+    st.subheader("Final Review (Text + Prompts + Images)")
 
     st.caption(
-        "Yahan se tum last time sab check kar sakte ho. Isi screen se prompt change + image regenerate bhi kar sakte ho. "
-        "Jab sab scenes sahi lagte hain, tab neeche se video render karo."
+        "Check everything one last time. You can still edit prompts and regenerate images here. "
+        "When you are happy with all scenes, render the video below."
     )
 
     missing = [sc["index"] for sc in scenes if not sc["image_data"]]
     if missing:
         st.warning(
             f"These scenes have no image yet: {missing}. "
-            "Har scene k liye image generate karo before rendering."
+            "Generate images for all scenes before rendering."
         )
 
     # Compact review with edit/regenerate again
@@ -921,7 +926,7 @@ if scenes:
                 height=80,
             )
 
-            # final prompt bhi scene obj me update
+            # update final prompt into scene object
             sc["prompt"] = new_prompt_final
 
             col1, col2 = st.columns([1, 2])
@@ -970,6 +975,7 @@ if scenes:
                     audio_path,
                     color_mode=color_mode,
                     zoom_strength=zoom_strength,
+                    audio_duration=st.session_state.audio_duration,
                 )
 
             if final_vid_path is None:
@@ -992,7 +998,7 @@ if scenes:
 # =========================
 
 if st.session_state.transcription_raw:
-    with st.expander("🧩 Transcription Output (raw JSON + scenes)", expanded=False):
+    with st.expander("Transcription Output (raw JSON + scenes)", expanded=False):
         st.subheader("Raw transcription JSON")
         st.json(st.session_state.transcription_raw)
         st.subheader("Scenes (index, start, end, text)")
@@ -1009,5 +1015,5 @@ if st.session_state.transcription_raw:
         )
 
 if st.session_state.prompt_raw:
-    with st.expander("🧠 Image prompts (raw model output)", expanded=False):
+    with st.expander("Image prompts (raw model output)", expanded=False):
         st.text(st.session_state.prompt_raw)
