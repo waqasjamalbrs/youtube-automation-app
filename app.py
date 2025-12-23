@@ -669,6 +669,9 @@ with st.sidebar:
 st.title("🎬 AI Video Generator")
 
 st.markdown(
+    """
+
+"""
 )
 
 audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
