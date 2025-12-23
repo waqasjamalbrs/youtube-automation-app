@@ -242,7 +242,6 @@ def get_transcript_chunks(
         end = w.get("end", start)
 
         gap = start - prev_end
-        current_duration = prev_end - current_start
         too_many_words = len(current_words) >= max_words_per_chunk
 
         # Split only on silence or too many words
@@ -285,7 +284,7 @@ def get_transcript_chunks(
 
 
 # =========================
-# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT)
+# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT, ROBUST)
 # =========================
 
 def generate_image_prompts_for_chunks(chunks):
@@ -293,11 +292,10 @@ def generate_image_prompts_for_chunks(chunks):
     For each chunk, generate an image prompt using a text model.
     Model output is plain text, not JSON.
 
-    Expected format:
-
-      Scene 1: cinematic prompt...
-      Scene 2: another prompt...
-      Scene 3: ...
+    Expected format per line (flexible):
+      Scene 1: ...
+      Scene 2 - ...
+      Scene 3 – ...
     """
     if not chunks:
         return {}, None
@@ -371,27 +369,45 @@ Rules:
 
     raw_text = text
 
-    # Parse lines: Scene <index>: <prompt>
+    # Parse lines: Scene <index>: or Scene <index> - / – <prompt>
+    line_pattern = re.compile(
+        r"\s*Scene\s+(\d+)\s*[:\-–]\s*(.+)",
+        re.IGNORECASE,
+    )
+
     prompts_map = {}
     for line in raw_text.splitlines():
-        m = re.match(r"\s*Scene\s+(\d+)\s*:\s*(.+)", line, re.IGNORECASE)
+        m = line_pattern.match(line)
         if m:
             idx = int(m.group(1))
             pmt = m.group(2).strip()
             if pmt:
                 prompts_map[idx] = pmt
 
-    # Strict: every chunk must have a prompt
     expected_indexes = {c["index"] for c in chunks}
     missing = sorted(list(expected_indexes - set(prompts_map.keys())))
+
     if missing:
-        st.error(
-            f"❌ Some scene prompts are missing from the AI response. "
-            f"Missing scene indexes: {missing}\n\n"
-            "Open the 'Image prompts' debug expander, check the model output, "
-            "and try again."
+        st.warning(
+            f"Some scene prompts were missing from the model output. "
+            f"Missing indexes: {missing}. "
+            f"Using automatic fallback prompts for those scenes."
         )
-        return {}, raw_text
+        # Build index → chunk map for fallbacks
+        idx_to_chunk = {c["index"]: c for c in chunks}
+        for mi in missing:
+            ch = idx_to_chunk.get(mi)
+            if not ch:
+                continue
+            text_snip = ch["text"]
+            if len(text_snip) > 200:
+                text_snip = text_snip[:200] + "..."
+            fallback = (
+                "cinematic illustration of: "
+                + text_snip
+                + ", detailed, realistic, dramatic lighting, high quality"
+            )
+            prompts_map[mi] = fallback
 
     return prompts_map, raw_text
 
