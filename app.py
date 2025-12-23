@@ -3,10 +3,8 @@ import re
 import json
 import time
 import shutil
-import base64
 import tempfile
 import subprocess
-from io import BytesIO
 from typing import List, Tuple
 from urllib.parse import urljoin
 
@@ -15,7 +13,6 @@ import streamlit as st
 import cv2
 import numpy as np
 from groq import Groq
-from PIL import Image
 
 # =========================
 # PAGE CONFIG
@@ -166,7 +163,7 @@ def get_transcript_chunks(
     audio_duration=None,
     max_gap=1.5,
     max_words_per_chunk=25,
-    max_chunk_duration=12.0,
+    max_chunk_duration=5.0,  # ~max 5 sec scenes
 ):
     """
     Transcription API:
@@ -180,7 +177,7 @@ def get_transcript_chunks(
     Return:
         full_text (str),
         chunks = [
-          {"index": 1, "text": "...", "start": 0.5, "end": 7.8},
+          {"index": 1, "text": "...", "start": 0.5, "end": 5.2},
           ...
         ],
         raw (dict)
@@ -277,7 +274,7 @@ def get_transcript_chunks(
         )
 
     if audio_duration and chunks:
-        # last chunk ko audio ke end ke sath align rakhna
+        # last chunk ko audio ke end ke sath thoda align rakhna
         if chunks[-1]["end"] > audio_duration + 0.3:
             chunks[-1]["end"] = float(audio_duration)
         elif chunks[-1]["end"] < audio_duration - 0.5:
@@ -287,22 +284,21 @@ def get_transcript_chunks(
 
 
 # =========================
-# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT)
+# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT + STYLE)
 # =========================
 
-def generate_image_prompts_for_chunks(chunks):
+def generate_image_prompts_for_chunks(chunks, global_style_text: str = ""):
     """
     Har chunk ke liye ek image-generation prompt.
-    Model se output **plain text** me lenge, JSON nahi.
-    Format jo hum expect kar rahe hain:
+    Output: plain text, JSON nahi.
+
+    Expected format:
 
       Scene 1: cinematic prompt...
       Scene 2: another prompt...
-      Scene 3: ...
+      ...
 
-    Return:
-        prompts_map: {chunk_index: prompt_str}
-        raw_text: str (model ka raw response)
+    global_style_text → e.g. "black and white, high contrast, documentary style"
     """
     if not chunks:
         return {}, None
@@ -323,6 +319,14 @@ def generate_image_prompts_for_chunks(chunks):
             }
         )
 
+    style_instruction = ""
+    if global_style_text:
+        style_instruction = f"""
+GLOBAL STYLE PREFERENCE:
+The user wants all images in this style: "{global_style_text}".
+Make sure every scene prompt explicitly reflects this visual style.
+"""
+
     prompt = f"""
 You are an AI storyboard artist for a video.
 
@@ -342,6 +346,8 @@ Goals:
   (e.g. "wide shot", "close-up", "cinematic lighting", "dramatic shadows").
 - Do NOT mention the word "chunk", "voiceover", "caption", or any subtitles.
 - Do NOT add anything about on-screen text or UI.
+
+{style_instruction}
 
 CHUNKS:
 {json.dumps(chunks_brief, ensure_ascii=False, indent=2)}
@@ -398,6 +404,14 @@ Rules:
         )
         return {}, raw_text
 
+    # Extra safety: global style suffix append
+    if global_style_text:
+        suffix = ", " + global_style_text
+        for idx, p in list(prompts_map.items()):
+            # agar style already mention nahi to append
+            if global_style_text.lower() not in p.lower():
+                prompts_map[idx] = p.rstrip(".") + suffix
+
     return prompts_map, raw_text
 
 
@@ -452,7 +466,37 @@ def generate_image_from_prompt(prompt, aspect_ratio, mode_label, api_key, timeou
 # VIDEO RENDERING FROM SCENES (100% SYNC)
 # =========================
 
-def render_video_from_scenes(scenes, audio_path, output_name="final_video.mp4"):
+def apply_color_and_grain(frame, color_mode, film_grain, grain_strength):
+    """Black & white conversion + film grain noise."""
+    img = frame
+
+    # Black & white
+    if color_mode == "Black & white":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    # Film grain / noise
+    if film_grain and grain_strength > 0:
+        noise = np.random.normal(
+            0,
+            grain_strength,
+            img.shape
+        ).astype(np.float32)
+        noisy = img.astype(np.float32) + noise
+        img = np.clip(noisy, 0, 255).astype(np.uint8)
+
+    return img
+
+
+def render_video_from_scenes(
+    scenes,
+    audio_path,
+    output_name="final_video.mp4",
+    color_mode="Full color",
+    film_grain=False,
+    grain_strength=10,
+    zoom_strength=0.05,
+):
     """
     Scenes: list of dicts:
         {
@@ -524,11 +568,24 @@ def render_video_from_scenes(scenes, audio_path, output_name="final_video.mp4"):
                 out.release()
                 return None
 
-            scale = 1.0 + (0.05 * i / frames_in_clip)
+            # Zoom in + out wave: minimum at edges, max at center
+            t = i / max(frames_in_clip - 1, 1)  # 0 → 1
+            centered = 2 * t - 1                 # -1 → 1
+            amp = 1 - abs(centered)             # 0 → 1 → 0
+            scale = 1.0 + zoom_strength * amp
+
             M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
             zoomed = cv2.warpAffine(img, M, (width, height))
 
-            out.write(zoomed)
+            # Apply color mode + grain
+            frame = apply_color_and_grain(
+                zoomed,
+                color_mode=color_mode,
+                film_grain=film_grain,
+                grain_strength=grain_strength,
+            )
+
+            out.write(frame)
             current_frame += 1
 
             if current_frame % 20 == 0:
@@ -589,6 +646,73 @@ def render_video_from_scenes(scenes, audio_path, output_name="final_video.mp4"):
     return final_output_abs
 
 
+def render_preview_scene(
+    scene,
+    output_name="preview_scene.mp4",
+    color_mode="Full color",
+    film_grain=False,
+    grain_strength=10,
+    zoom_strength=0.05,
+):
+    """
+    Sirf ek scene ka chhota preview (mute, no audio).
+    Zoom in/out + B&W + grain yahi effect use karega jo final video me hoga.
+    """
+    width, height = 854, 480
+    fps = 24
+
+    preview_path = os.path.join(TEMP_DIR, output_name)
+    preview_abs = os.path.abspath(preview_path)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(preview_abs, fourcc, fps, (width, height))
+
+    duration = max(float(scene["end"] - scene["start"]), 0.5)
+    img_bytes = scene.get("image_data")
+    if not img_bytes:
+        st.error("This scene has no image to preview.")
+        return None
+
+    file_bytes = np.asarray(bytearray(img_bytes), dtype=np.uint8)
+    img = cv2.imdecode(file_bytes, 1)
+    if img is None:
+        st.error("Failed to decode scene image.")
+        return None
+
+    img = cv2.resize(img, (width, height))
+    frames_in_clip = max(int(duration * fps), 1)
+
+    for i in range(frames_in_clip):
+        if st.session_state.stop_requested:
+            st.warning("⛔ Stopped during preview.")
+            out.release()
+            return None
+
+        t = i / max(frames_in_clip - 1, 1)
+        centered = 2 * t - 1
+        amp = 1 - abs(centered)
+        scale = 1.0 + zoom_strength * amp
+
+        M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
+        zoomed = cv2.warpAffine(img, M, (width, height))
+
+        frame = apply_color_and_grain(
+            zoomed,
+            color_mode=color_mode,
+            film_grain=film_grain,
+            grain_strength=grain_strength,
+        )
+        out.write(frame)
+
+    out.release()
+
+    if not os.path.exists(preview_abs):
+        st.error("❌ Preview video was not created.")
+        return None
+
+    return preview_abs
+
+
 # =========================
 # SESSION STATE STRUCTURE
 # =========================
@@ -613,7 +737,7 @@ if "prompt_raw" not in st.session_state:
 # =========================
 
 with st.sidebar:
-    st.header("Image Settings")
+    st.header("Image / Video Settings")
 
     mode_label = st.selectbox(
         "Image mode",
@@ -623,10 +747,61 @@ with st.sidebar:
     )
 
     aspect_ratio = st.selectbox(
-        "Aspect ratio",
+        "Image aspect ratio",
         ["16:9", "9:16", "1:1"],
         index=0,
-        help="Select the output aspect ratio.",
+        help="Select the image aspect ratio.",
+    )
+
+    visual_style_label = st.selectbox(
+        "Global visual style (applied in prompts)",
+        [
+            "Neutral / default",
+            "Black & white documentary",
+            "Warm vintage / sepia",
+            "Cold cinematic (blue & orange)",
+        ],
+        index=0,
+        help="Choose before generating prompts/images.",
+    )
+
+    # Map style label → style text
+    style_suffix = ""
+    if visual_style_label == "Black & white documentary":
+        style_suffix = "black and white, high contrast, documentary style, subtle film grain"
+    elif visual_style_label == "Warm vintage / sepia":
+        style_suffix = "warm vintage colors, slight sepia tone, soft film look"
+    elif visual_style_label == "Cold cinematic (blue & orange)":
+        style_suffix = "cinematic color grading, teal and orange, dramatic lighting"
+
+    color_mode = st.selectbox(
+        "Video color mode",
+        ["Full color", "Black & white"],
+        index=0,
+        help="Applies at render time to all frames.",
+    )
+
+    film_grain = st.checkbox(
+        "Add film grain / noise",
+        value=False,
+        help="Adds subtle noise like vintage / black-noise effect.",
+    )
+
+    grain_strength = st.slider(
+        "Grain strength",
+        0,
+        50,
+        10,
+        help="Higher = stronger noise. Works if film grain is enabled.",
+    )
+
+    zoom_strength = st.slider(
+        "Zoom in/out strength",
+        0.0,
+        0.2,
+        0.05,
+        step=0.01,
+        help="Controls how strong the zoom animation is.",
     )
 
     timeout = st.slider("Image request timeout (seconds)", 10, 180, 60)
@@ -644,11 +819,12 @@ st.markdown(
     """
 **Flow:**
 
-1. Voiceover se transcript + timestamps + scenes  
-2. Har scene ke liye automatic image prompts  
+1. Voiceover se transcript + timestamps + scenes (max ~5s per scene)  
+2. Har scene ke liye automatic image prompts (global style apply hota hai)  
 3. Har scene ka prompt edit + image generate / regenerate  
-4. Final review screen: voiceover text + prompt + image  
-5. Jab tum confirm karo, tab video render (timestamps = 100% sync)  
+4. Final review screen: voiceover text + prompt + image (yahin se bhi edit/regenerate)  
+5. Zoom + color + grain ka preview (first scene)  
+6. Jab tum confirm karo, tab final video render (timestamps = 100% sync)  
 """
 )
 
@@ -714,7 +890,10 @@ if analyze:
     # Transcription
     status.write("👂 Getting transcript + timestamps...")
     full_text, chunks, raw = get_transcript_chunks(
-        local_audio, audio_duration=audio_duration
+        local_audio,
+        audio_duration=audio_duration,
+        max_chunk_duration=5.0,   # enforce ~5s chunks
+        max_words_per_chunk=25,
     )
     st.session_state.transcription_raw = raw
 
@@ -726,9 +905,12 @@ if analyze:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # Text model: prompts
+    # Text model: prompts (with global style)
     status.write("🧠 Generating image prompts for each scene...")
-    prompts_map, prompt_raw = generate_image_prompts_for_chunks(chunks)
+    prompts_map, prompt_raw = generate_image_prompts_for_chunks(
+        chunks,
+        global_style_text=style_suffix,
+    )
     st.session_state.prompt_raw = prompt_raw
 
     if not prompts_map:
@@ -863,7 +1045,7 @@ if scenes:
     st.divider()
 
     # =========================
-    # FINAL REVIEW (VOICEOVER + PROMPT + IMAGE) BEFORE RENDER
+    # FINAL REVIEW (VOICEOVER + PROMPT + IMAGE) + PREVIEW
     # =========================
 
     st.subheader("3️⃣ Final Review (Text + Prompts + Images)")
@@ -872,6 +1054,27 @@ if scenes:
         "Yahan se tum last time sab check kar sakte ho. Isi screen se prompt change + image regenerate bhi kar sakte ho. "
         "Jab sab scenes sahi lagte hain, tab neeche se video render karo."
     )
+
+    # Preview first scene with current zoom/color/grain
+    preview_btn = st.button("👁️ Preview first scene (no audio)")
+    if preview_btn:
+        first_scene = scenes[0]
+        if not first_scene.get("image_data"):
+            st.error("First scene has no image yet. Generate it before preview.")
+        else:
+            with st.spinner("Rendering preview for first scene..."):
+                preview_path = render_preview_scene(
+                    first_scene,
+                    output_name="preview_scene.mp4",
+                    color_mode=color_mode,
+                    film_grain=film_grain,
+                    grain_strength=grain_strength,
+                    zoom_strength=zoom_strength,
+                )
+            if preview_path:
+                with open(preview_path, "rb") as f:
+                    preview_bytes = f.read()
+                st.video(preview_bytes)
 
     missing = [sc["index"] for sc in scenes if not sc["image_data"]]
     if missing:
@@ -944,7 +1147,12 @@ if scenes:
             st.session_state.stop_requested = False
             with st.spinner("Rendering video..."):
                 final_vid_path = render_video_from_scenes(
-                    st.session_state.scenes, audio_path
+                    st.session_state.scenes,
+                    audio_path,
+                    color_mode=color_mode,
+                    film_grain=film_grain,
+                    grain_strength=grain_strength,
+                    zoom_strength=zoom_strength,
                 )
 
             if final_vid_path is None:
