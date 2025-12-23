@@ -50,7 +50,7 @@ except Exception:
     st.error("🚨 Please add DEEPGRAM_API_KEY in Streamlit secrets.")
     st.stop()
 
-# Text model API key
+# Text model API key (Groq)
 GROQ_KEY = st.secrets.get("GROQ_API_KEY")
 if not GROQ_KEY:
     st.error("🚨 Please add GROQ_API_KEY in Streamlit secrets.")
@@ -77,7 +77,7 @@ TEMP_DIR = BASE_TEMP_DIR
 
 
 def clean_temp_dir():
-    """Clean old files inside the temp directory before each run."""
+    """Har run se pehle temp dir ke andar ki purani files clean kar do."""
     if not os.path.exists(TEMP_DIR):
         os.makedirs(TEMP_DIR, exist_ok=True)
         return
@@ -107,7 +107,7 @@ def safe_name(s: str, max_len: int = 60) -> str:
 
 
 def get_audio_duration(audio_path: str):
-    """Get audio duration (seconds) using ffprobe."""
+    """ffprobe se audio ki duration (seconds) nikal lo."""
     try:
         result = subprocess.run(
             [
@@ -166,14 +166,16 @@ def get_transcript_chunks(
     audio_duration=None,
     max_gap=1.5,
     max_words_per_chunk=25,
+    max_chunk_duration=30.0,  # no strict 5s; mostly silence + words decide
 ):
     """
     Transcription API:
     - full transcript
     - word timestamps
-    - splits words into chunks (segments):
-        - if there is a large silence gap
-        - OR too many words
+    - words ko chunks (segments) me todta hai:
+        - agar words ke beech bohot gap ho (silence)
+        - YA words count zyada ho jaye
+        - YA chunk ki duration bohot badi ho jaye
 
     Return:
         full_text (str),
@@ -242,10 +244,11 @@ def get_transcript_chunks(
         end = w.get("end", start)
 
         gap = start - prev_end
+        current_duration = prev_end - current_start
+        too_long = current_duration >= max_chunk_duration
         too_many_words = len(current_words) >= max_words_per_chunk
 
-        # Split only on silence or too many words
-        if (gap > max_gap or too_many_words) and current_words:
+        if (gap > max_gap or too_long or too_many_words) and current_words:
             chunk_text = " ".join(current_words).strip()
             chunks.append(
                 {
@@ -273,8 +276,8 @@ def get_transcript_chunks(
             }
         )
 
-    # Align last chunk to audio end if needed
     if audio_duration and chunks:
+        # last chunk ko audio ke end ke sath align rakhna
         if chunks[-1]["end"] > audio_duration + 0.3:
             chunks[-1]["end"] = float(audio_duration)
         elif chunks[-1]["end"] < audio_duration - 0.5:
@@ -284,23 +287,28 @@ def get_transcript_chunks(
 
 
 # =========================
-# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT, ROBUST)
+# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT, GROQ LLAMA-4 MAVERICK)
 # =========================
 
 def generate_image_prompts_for_chunks(chunks):
     """
-    For each chunk, generate an image prompt using a text model.
-    Model output is plain text, not JSON.
+    Har chunk ke liye ek image-generation prompt.
+    Model se output **plain text** me lenge, JSON nahi.
+    Format jo hum expect kar rahe hain:
 
-    Expected format per line (flexible):
-      Scene 1: ...
-      Scene 2 - ...
-      Scene 3 – ...
+      Scene 1: cinematic prompt...
+      Scene 2: another prompt...
+      Scene 3: ...
+
+    Return:
+        prompts_map: {chunk_index: prompt_str}
+        raw_text: str (model ka raw response)
     """
     if not chunks:
         return {}, None
 
-    model_id = "llama-3.1-8b-instant"
+    # Groq Llama 4 Maverick model
+    model_id = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
     chunks_brief = []
     for c in chunks:
@@ -317,7 +325,7 @@ def generate_image_prompts_for_chunks(chunks):
         )
 
     prompt = f"""
-You are an AI storyboard artist for a video.
+You are an expert cinematic storyboard artist.
 
 You receive a list of narration CHUNKS from a voiceover, each with:
 - index
@@ -328,13 +336,14 @@ You receive a list of narration CHUNKS from a voiceover, each with:
 Your job is to create ONE image-generation prompt PER chunk.
 
 Goals:
-- Each prompt should visually represent the meaning of that chunk.
+- Each prompt must closely match the meaning and mood of that chunk.
 - Imagine this is for a cinematic video.
 - Use clear, specific English.
 - You can mention camera / composition / lighting when helpful
   (e.g. "wide shot", "close-up", "cinematic lighting", "dramatic shadows").
 - Do NOT mention the word "chunk", "voiceover", "caption", or any subtitles.
 - Do NOT add anything about on-screen text or UI.
+- Keep each prompt as a single sentence or short paragraph focused on visuals only.
 
 CHUNKS:
 {json.dumps(chunks_brief, ensure_ascii=False, indent=2)}
@@ -369,45 +378,27 @@ Rules:
 
     raw_text = text
 
-    # Parse lines: Scene <index>: or Scene <index> - / – <prompt>
-    line_pattern = re.compile(
-        r"\s*Scene\s+(\d+)\s*[:\-–]\s*(.+)",
-        re.IGNORECASE,
-    )
-
+    # Parse lines: Scene <index>: <prompt>
     prompts_map = {}
     for line in raw_text.splitlines():
-        m = line_pattern.match(line)
+        m = re.match(r"\s*Scene\s+(\d+)\s*:\s*(.+)", line, re.IGNORECASE)
         if m:
             idx = int(m.group(1))
             pmt = m.group(2).strip()
             if pmt:
                 prompts_map[idx] = pmt
 
+    # Strict: har chunk k liye prompt required
     expected_indexes = {c["index"] for c in chunks}
     missing = sorted(list(expected_indexes - set(prompts_map.keys())))
-
     if missing:
-        st.warning(
-            f"Some scene prompts were missing from the model output. "
-            f"Missing indexes: {missing}. "
-            f"Using automatic fallback prompts for those scenes."
+        st.error(
+            f"❌ Some scene prompts are missing from the AI response. "
+            f"Missing scene indexes: {missing}\n\n"
+            "Open the 'Image prompts' debug expander, check the model output, "
+            "and try again."
         )
-        # Build index → chunk map for fallbacks
-        idx_to_chunk = {c["index"]: c for c in chunks}
-        for mi in missing:
-            ch = idx_to_chunk.get(mi)
-            if not ch:
-                continue
-            text_snip = ch["text"]
-            if len(text_snip) > 200:
-                text_snip = text_snip[:200] + "..."
-            fallback = (
-                "cinematic illustration of: "
-                + text_snip
-                + ", detailed, realistic, dramatic lighting, high quality"
-            )
-            prompts_map[mi] = fallback
+        return {}, raw_text
 
     return prompts_map, raw_text
 
@@ -460,7 +451,7 @@ def generate_image_from_prompt(prompt, aspect_ratio, mode_label, api_key, timeou
 
 
 # =========================
-# VIDEO RENDERING FROM SCENES (STRICT FRAME TIMELINE)
+# VIDEO RENDERING FROM SCENES (FRAME-BASED SYNC)
 # =========================
 
 def render_video_from_scenes(
@@ -468,7 +459,6 @@ def render_video_from_scenes(
     audio_path,
     color_mode="Color",
     zoom_strength=0.05,
-    audio_duration=None,
     output_name="final_video.mp4",
 ):
     """
@@ -483,10 +473,10 @@ def render_video_from_scenes(
           "image_data": bytes
         }
 
-    Sync strategy:
-        - Convert each scene's start/end timestamps to frame indices.
-        - Ensure scenes are contiguous in frame space.
-        - Adjust the last scene so that total video frames match audio length (if known).
+    Sync:
+        - Frame-based: har scene ka start/end Deepgram timestamps *fps* se
+          frames me convert hota hai, isi se frames_in_clip nikalte hain.
+        - Is se floor/rounding drift accumulate nahi hota.
     """
     if not scenes:
         st.error("No scenes to render.")
@@ -500,50 +490,6 @@ def render_video_from_scenes(
     width, height = 854, 480
     fps = 24
 
-    # If audio_duration not passed, compute here
-    if audio_duration is None:
-        audio_duration = get_audio_duration(audio_path)
-
-    # Compute frame ranges per scene using timestamps
-    frames_per_scene: List[int] = []
-    prev_end_frame = 0
-
-    for sc in scenes:
-        start_s = float(sc["start"])
-        end_s = float(sc["end"])
-
-        start_f = int(round(start_s * fps))
-        end_f = int(round(end_s * fps))
-
-        # Ensure monotonic non-overlapping frames
-        if start_f < prev_end_frame:
-            start_f = prev_end_frame
-        if end_f <= start_f:
-            end_f = start_f + 1
-
-        frames_in_scene = end_f - start_f
-        frames_per_scene.append(frames_in_scene)
-        prev_end_frame = end_f
-
-    # Adjust last scene frames to match audio total length (if we know it)
-    if audio_duration is not None and audio_duration > 0:
-        target_total_frames = max(int(round(audio_duration * fps)), 1)
-        current_total_frames = sum(frames_per_scene)
-
-        if current_total_frames < target_total_frames:
-            # Extend last scene
-            extra = target_total_frames - current_total_frames
-            frames_per_scene[-1] += extra
-        elif current_total_frames > target_total_frames:
-            # Shorten last scene (at least 1 frame)
-            reduce_by = min(
-                current_total_frames - target_total_frames,
-                frames_per_scene[-1] - 1,
-            )
-            frames_per_scene[-1] -= reduce_by
-
-    total_frames_all = sum(frames_per_scene)
-
     temp_video = os.path.join(TEMP_DIR, "temp_silent.mp4")
     final_output = os.path.join(TEMP_DIR, output_name)
 
@@ -554,20 +500,39 @@ def render_video_from_scenes(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(temp_video_abs, fourcc, fps, (width, height))
 
-    st.write("🎥 Rendering video frames...")
+    # Precompute frame ranges per scene
+    scene_frame_ranges = []
+    for sc in scenes:
+        start_s = max(float(sc["start"]), 0.0)
+        end_s = max(float(sc["end"]), start_s + 0.04)
+
+        start_f = int(round(start_s * fps))
+        end_f = int(round(end_s * fps))
+        if end_f <= start_f:
+            end_f = start_f + 1
+
+        scene_frame_ranges.append((start_f, end_f))
+
+    total_frames_all = sum(end_f - start_f for (start_f, end_f) in scene_frame_ranges)
+    if total_frames_all <= 0:
+        st.error("❌ Computed total frames <= 0. Check timestamps.")
+        return None
+
+    st.write("🎥 Rendering video frames (frame-accurate sync)...")
     progress_bar = st.progress(0)
     percent_text = st.empty()
 
     current_frame = 0
 
-    for sc, frames_in_clip in zip(scenes, frames_per_scene):
+    for sc, (start_f, end_f) in zip(scenes, scene_frame_ranges):
         if st.session_state.stop_requested:
             st.warning("⛔ Stopped during rendering.")
             out.release()
             return None
 
+        frames_in_clip = max(end_f - start_f, 1)
         img_bytes = sc["image_data"]
-        if not img_bytes or frames_in_clip <= 0:
+        if not img_bytes:
             continue
 
         file_bytes = np.asarray(bytearray(img_bytes), dtype=np.uint8)
@@ -583,8 +548,8 @@ def render_video_from_scenes(
                 out.release()
                 return None
 
-            # zoom_strength slider controls zoom-in effect
-            scale = 1.0 + (zoom_strength * i / max(frames_in_clip - 1, 1))
+            # zoom_strength slider se control
+            scale = 1.0 + (zoom_strength * i / frames_in_clip)
             M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
             frame = cv2.warpAffine(img, M, (width, height))
 
@@ -721,6 +686,8 @@ with st.sidebar:
 
 st.title("🎬 AI Video Generator")
 
+st.markdown("")
+
 audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
 
 st.divider()
@@ -742,7 +709,7 @@ if reset:
     st.stop()
 
 # =========================
-# STEP 1: ANALYZE (TRANSCRIPT + PROMPTS)
+# STEP 1: ANALYZE (TRANSCRIPT + PROMPTS + AUTO IMAGES)
 # =========================
 
 if analyze:
@@ -755,11 +722,11 @@ if analyze:
     status = st.status("Starting analysis...", expanded=True)
 
     # Clean temp
-    status.write("Cleaning temp folder...")
+    status.write("🧹 Cleaning temp folder...")
     clean_temp_dir()
 
     # Save audio
-    status.write("Saving audio file...")
+    status.write("💾 Saving audio file...")
     local_audio = os.path.join(TEMP_DIR, "input.mp3")
     local_audio = os.path.abspath(local_audio)
     with open(local_audio, "wb") as f:
@@ -774,17 +741,16 @@ if analyze:
     st.session_state.audio_duration = audio_duration
 
     if audio_duration:
-        status.write(f"Audio duration: ~{audio_duration:.2f} seconds")
+        status.write(f"⏱️ Audio duration: ~{audio_duration:.2f} seconds")
 
     if st.session_state.stop_requested:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # Transcription (no hard 5s limit, only silence/word-based)
-    status.write("Getting transcript and timestamps...")
+    # Transcription (no enforced 5s max, default settings)
+    status.write("👂 Getting transcript + timestamps...")
     full_text, chunks, raw = get_transcript_chunks(
-        local_audio,
-        audio_duration=audio_duration,
+        local_audio, audio_duration=audio_duration
     )
     st.session_state.transcription_raw = raw
 
@@ -796,8 +762,8 @@ if analyze:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # Text model: prompts
-    status.write("Generating image prompts for each scene...")
+    # Text model: prompts (Groq Llama-4 Maverick)
+    status.write("🧠 Generating image prompts for each scene (Groq Llama-4 Maverick)...")
     prompts_map, prompt_raw = generate_image_prompts_for_chunks(chunks)
     st.session_state.prompt_raw = prompt_raw
 
@@ -805,7 +771,7 @@ if analyze:
         status.update(label="❌ Prompt generation failed.", state="error", expanded=True)
         st.stop()
 
-    # Build scenes
+    # Build scenes (text + prompts)
     scenes = []
     for c in chunks:
         idx = c["index"]
@@ -821,9 +787,43 @@ if analyze:
             }
         )
 
+    # Auto-generate images for all scenes right here
+    status.write("🖼️ Generating images for all scenes...")
+    img_progress = st.progress(0.0)
+    total_scenes = len(scenes)
+    generated_count = 0
+
+    for i, sc in enumerate(scenes, start=1):
+        if st.session_state.stop_requested:
+            st.warning("⛔ Stopped during image generation.")
+            break
+        try:
+            with st.spinner(f"Generating image for scene {sc['index']}..."):
+                fname, data, _ = generate_image_from_prompt(
+                    sc["prompt"],
+                    aspect_ratio,
+                    mode_label,
+                    IMAGE_API_KEY,
+                    timeout=timeout,
+                )
+                sc["image_name"] = fname
+                sc["image_data"] = data
+                generated_count += 1
+        except Exception as e:
+            st.error(f"Scene {sc['index']} image error: {e}")
+        img_progress.progress(i / total_scenes)
+
     st.session_state.scenes = scenes
-    status.update(label="✅ Scenes created!", state="complete", expanded=False)
-    st.success("Scenes created. Scroll down to edit prompts and generate images.")
+
+    if generated_count == total_scenes:
+        status.update(label="✅ Scenes + prompts + images ready!", state="complete", expanded=False)
+        st.success("All scenes created and images generated. Scroll down to review or edit.")
+    else:
+        status.update(
+            label=f"⚠️ Scenes created, but some images failed ({generated_count}/{total_scenes}).",
+            state="running",
+            expanded=True,
+        )
 
 
 # =========================
@@ -834,13 +834,13 @@ scenes = st.session_state.scenes
 audio_path = st.session_state.audio_path
 
 if scenes:
-    st.subheader("Scene Prompts & Images")
+    st.subheader("Scene Prompts & Images (Editing)")
 
     st.caption(
-        "Each scene is linked to the voiceover. Edit prompts and generate/regenerate images for each scene."
+        "Har scene voiceover se linked hai. Prompt edit karo, phir image generate / regenerate karo."
     )
 
-    # Bulk generate for scenes without image
+    # Optional: Bulk generate for scenes without image (fallback)
     if st.button("🖼️ Generate images for ALL scenes without image"):
         for sc in scenes:
             if st.session_state.stop_requested:
@@ -939,15 +939,15 @@ if scenes:
     st.subheader("Final Review (Text + Prompts + Images)")
 
     st.caption(
-        "Check everything one last time. You can still edit prompts and regenerate images here. "
-        "When you are happy with all scenes, render the video below."
+        "Yahan se tum last time sab check kar sakte ho. Isi screen se prompt change + image regenerate bhi kar sakte ho. "
+        "Jab sab scenes sahi lagte hain, tab neeche se video render karo."
     )
 
     missing = [sc["index"] for sc in scenes if not sc["image_data"]]
     if missing:
         st.warning(
             f"These scenes have no image yet: {missing}. "
-            "Generate images for all scenes before rendering."
+            "Har scene k liye image generate karo before rendering."
         )
 
     # Compact review with edit/regenerate again
@@ -969,7 +969,7 @@ if scenes:
                 height=80,
             )
 
-            # update final prompt into scene object
+            # final prompt bhi scene obj me update
             sc["prompt"] = new_prompt_final
 
             col1, col2 = st.columns([1, 2])
@@ -1018,7 +1018,6 @@ if scenes:
                     audio_path,
                     color_mode=color_mode,
                     zoom_strength=zoom_strength,
-                    audio_duration=st.session_state.audio_duration,
                 )
 
             if final_vid_path is None:
@@ -1041,7 +1040,7 @@ if scenes:
 # =========================
 
 if st.session_state.transcription_raw:
-    with st.expander("Transcription Output (raw JSON + scenes)", expanded=False):
+    with st.expander("🧩 Transcription Output (raw JSON + scenes)", expanded=False):
         st.subheader("Raw transcription JSON")
         st.json(st.session_state.transcription_raw)
         st.subheader("Scenes (index, start, end, text)")
@@ -1058,5 +1057,5 @@ if st.session_state.transcription_raw:
         )
 
 if st.session_state.prompt_raw:
-    with st.expander("Image prompts (raw model output)", expanded=False):
+    with st.expander("🧠 Image prompts (raw model output)", expanded=False):
         st.text(st.session_state.prompt_raw)
