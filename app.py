@@ -11,13 +11,14 @@ import requests
 import base64
 from io import BytesIO
 import tempfile
+import re
 
 # =========================
 # PAGE CONFIG
 # =========================
 
 st.set_page_config(
-    page_title="AI Video Generator (Deepgram + Groq Full Debug)",
+    page_title="AI Video Generator (Deepgram + Groq)",
     page_icon="🎬",
     layout="wide",
 )
@@ -46,7 +47,7 @@ except Exception:
 
 GROQ_KEY = st.secrets.get("GROQ_API_KEY", None)
 if not GROQ_KEY:
-    st.error("🚨 Please add GROQ_API_KEY in Streamlit secrets.")
+    st.error("🚨 Please add GROQ_API_KEY in Streamlit secrets as GROQ_API_KEY.")
     st.stop()
 
 groq_client = Groq(api_key=GROQ_KEY)
@@ -105,15 +106,24 @@ def get_audio_duration(audio_path: str):
 
 
 # =========================
-# DEEPGRAM: TRANSCRIPT + TIMESTAMPS
+# DEEPGRAM: TRANSCRIPT + TIMESTAMPS + SMART CHUNKS
 # =========================
 
-def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
+def get_transcript_chunks(
+    audio_path,
+    audio_duration=None,
+    max_gap=1.5,
+    max_words_per_chunk=25,
+    max_chunk_duration=12.0,
+):
     """
     Deepgram:
     - full transcript
     - word timestamps
-    - un words ko chunks (sentences / segments) me group karein.
+    - words ko chunks (segments) me todta hai:
+        - agar words ke beech bohot gap ho (silence)
+        - YA words count zyada ho jaye
+        - YA chunk ki duration bohot badi ho jaye
 
     Return:
         full_text (str),
@@ -182,9 +192,11 @@ def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
         end = w.get("end", start)
 
         gap = start - prev_end
+        current_duration = prev_end - current_start
+        too_long = current_duration >= max_chunk_duration
+        too_many_words = len(current_words) >= max_words_per_chunk
 
-        # agar beech ka gap zyada ho to naya chunk shuru
-        if gap > max_gap and current_words:
+        if (gap > max_gap or too_long or too_many_words) and current_words:
             chunk_text = " ".join(current_words).strip()
             chunks.append(
                 {
@@ -212,7 +224,6 @@ def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
             }
         )
 
-    # last chunk ko audio_duration se align kar do
     if audio_duration and chunks:
         if chunks[-1]["end"] > audio_duration + 0.3:
             chunks[-1]["end"] = float(audio_duration)
@@ -223,148 +234,142 @@ def get_transcript_chunks(audio_path, audio_duration=None, max_gap=2.0):
 
 
 # =========================
-# GROQ VISION: DESCRIBE IMAGES (BATCHES OF 5)
+# GROQ VISION: PER-IMAGE DESCRIPTION
 # =========================
-
-def encode_upload_to_data_url(uploaded_file):
-    """Uploaded image -> resized JPEG -> base64 data URL."""
-    uploaded_file.seek(0)
-    img = Image.open(uploaded_file).convert("RGB")
-    max_side = 1280
-    w, h = img.size
-    if max(w, h) > max_side:
-        scale = max_side / float(max(w, h))
-        img = img.resize((int(w * scale), int(h * scale)))
-
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
-
 
 def describe_all_images_with_groq(image_files, max_images=50):
     """
-    Groq Vision se sab images ki short descriptions nikalta hai.
-    - Batches of 5 images (model limit)
-    - Max `max_images` images use karega
-
+    Groq Vision se images ki detailed descriptions nikalta hai.
+    - Har image ke liye ALAG request (zyada accurate)
+    - Prompt: "What is in this image and what is happening?" (English)
     Returns:
         desc_map: {filename: description}
-        raw_responses: raw JSON objects list (for debug)
+        raw_responses: list of raw JSON responses (debug ke liye)
     """
     if not image_files:
         return {}, []
 
-    # Hard cap
     image_files = image_files[:max_images]
     model_id = "meta-llama/llama-4-scout-17b-16e-instruct"
 
     desc_map = {}
     raw_responses = []
 
-    batch_size = 5
     total = len(image_files)
     progress = st.progress(0)
     status = st.empty()
 
-    for i in range(0, total, batch_size):
+    for i, uf in enumerate(image_files, start=1):
         if st.session_state.stop_requested:
             st.warning("⛔ Stopped by user during image description.")
             break
 
-        batch = image_files[i : i + batch_size]
-        status.text(f"👁️ Describing images {i+1} to {min(i+batch_size, total)}...")
+        status.text(f"👁️ Describing image {i} of {total}: {uf.name}")
+
+        # image → resized JPEG → data URL
+        uf.seek(0)
+        img = Image.open(uf).convert("RGB")
+        max_side = 1280
+        w, h = img.size
+        if max(w, h) > max_side:
+            scale = max_side / float(max(w, h))
+            img = img.resize((int(w * scale), int(h * scale)))
+
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        data_url = f"data:image/jpeg;base64,{b64}"
 
         content = [
             {
                 "type": "text",
                 "text": (
-                    "You will see several images. After that, return ONLY JSON:\n"
+                    "You are describing ONE image.\n\n"
+                    "QUESTION:\n"
+                    "- What is in this image?\n"
+                    "- What is happening in this image?\n"
+                    "- Answer in clear, simple English.\n\n"
+                    "Return ONLY JSON in this exact format:\n"
                     "{\n"
-                    '  \"images\": [\n'
-                    '    { \"index\": 1, \"filename\": \"...\", \"description\": \"...\" },\n'
-                    '    { \"index\": 2, \"filename\": \"...\", \"description\": \"...\" }\n'
-                    "  ]\n"
+                    f'  \"filename\": \"{uf.name}\",\n'
+                    '  \"description\": "one or two sentences describing what is in the image and what is happening"\n'
                     "}\n"
-                    "Use very short English descriptions (one sentence)."
+                    "- Do NOT mention indexes.\n"
+                    "- Do NOT talk about other images.\n"
+                    "- Focus ONLY on this single image."
                 ),
-            }
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": data_url},
+            },
         ]
-
-        indexed_files = []
-        for idx, uf in enumerate(batch, start=1):
-            data_url = encode_upload_to_data_url(uf)
-            indexed_files.append((idx, uf.name))
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": data_url},
-                }
-            )
-            content.append(
-                {
-                    "type": "text",
-                    "text": f"Image {idx} (filename: {uf.name})",
-                }
-            )
 
         try:
             resp = groq_client.chat.completions.create(
                 model=model_id,
                 messages=[{"role": "user", "content": content}],
                 response_format={"type": "json_object"},
-                max_completion_tokens=512,
-                temperature=0.4,
+                max_completion_tokens=256,
+                temperature=0.2,
             )
             text = resp.choices[0].message.content or "{}"
             data = json.loads(text)
             raw_responses.append(data)
 
-            items = data.get("images", [])
-            # map by filename
-            for item in items:
-                fn = item.get("filename")
-                desc = item.get("description")
-                if fn and desc:
-                    desc_map[fn] = desc.strip()
-        except Exception as e:
-            st.warning(f"⚠️ Groq Vision batch failed: {e}")
+            desc = data.get("description") or ""
+            desc = desc.strip()
+            if not desc:
+                desc = "No clear description."
 
-        progress.progress(min((i + batch_size) / total, 1.0))
+            # apne actual filename ko source of truth rakhte hain
+            desc_map[uf.name] = desc
+        except Exception as e:
+            st.warning(f"⚠️ Groq Vision failed for {uf.name}: {e}")
+            desc_map[uf.name] = "Description failed."
+
+        progress.progress(i / total)
 
     return desc_map, raw_responses
 
 
 # =========================
-# GROQ TEXT: MAP CHUNKS -> IMAGES USING DESCRIPTIONS
+# GROQ TEXT: SEMANTIC MAPPING (VOICEOVER + DESCRIPTIONS)
 # =========================
 
 def map_chunks_to_images_using_descriptions(chunks, image_desc_map):
     """
-    Text-only mapping:
-    - chunks: [{index, text, start, end}]
-    - image_desc_map: {filename: description}
+    Groq TEXT se semantic mapping:
+    - CHUNKS (Deepgram se): [{index, text, start, end}]
+    - IMAGE_DESC_MAP: {filename: description}
 
     Groq ko:
       - chunks (brief)
-      - images list (filename + description)
-    bhejte hain, output JSON:
-      { "mappings": [ { "chunk_index": 1, "image": "file.png" }, ... ] }
+      - saari images (filename + description)
+    bhejte hain, aur yeh maangte hain:
+      {
+        "mappings": [
+          { "chunk_index": 1, "image": "some_file.png" },
+          ...
+        ]
+      }
 
-    Returns:
-      cleaned_mappings, raw_data
+    Rules:
+      - Har chunk_index EXACTLY once aana chahiye
+      - Image name IMAGES list se hi copy hona chahiye
+      - Sequence pe rely nahi karna, sirf meaning pe
     """
     if not chunks or not image_desc_map:
         return [], None
 
     model_id = "llama-3.1-8b-instant"
 
-    # shorten chunks for prompt
+    # short chunks for context
     chunks_brief = []
     for c in chunks:
-        text = c["text"]
-        if len(text) > 300:
-            text = text[:300] + "..."
+        text = c.get("text", "")
+        if len(text) > 350:
+            text = text[:350] + "..."
         chunks_brief.append({"index": c["index"], "text": text})
 
     images_list = [
@@ -372,30 +377,40 @@ def map_chunks_to_images_using_descriptions(chunks, image_desc_map):
         for fn, desc in image_desc_map.items()
     ]
 
+    num_chunks = len(chunks_brief)
+    num_images = len(images_list)
+    min_distinct = min(4, num_images)
+
     prompt = f"""
 You are aligning narration chunks with images.
 
-CHUNKS:
+CHUNKS (from a voiceover, already time-aligned separately):
 {json.dumps(chunks_brief, ensure_ascii=False, indent=2)}
 
-IMAGES:
+IMAGES (each with filename and description):
 {json.dumps(images_list, ensure_ascii=False, indent=2)}
 
 TASK:
-For each chunk, choose ONE image filename that best matches its meaning.
-Distribute chunks sensibly across images (do NOT assign all chunks to the same image).
+For EACH chunk in CHUNKS, choose EXACTLY ONE image filename from IMAGES
+that best matches the MEANING of that chunk's text.
+Use semantic similarity between the chunk text and the image description.
 
-Return ONLY JSON in this exact format:
+VERY IMPORTANT RULES:
+- You MUST create exactly {num_chunks} mapping objects.
+- Each "chunk_index" must appear EXACTLY ONCE in the mappings.
+- "image" must be EXACTLY one of the filenames from IMAGES (copy-paste).
+- Do NOT assign based on list order or index (no 1->1, 2->2 just by position).
+- REUSE of images is allowed, but ONLY if the meaning clearly matches.
+- Try to use AT LEAST {min_distinct} different images overall (if logically possible).
+- Do NOT assign all chunks to the same image.
+
+RETURN FORMAT (JSON ONLY):
 {{
   "mappings": [
-    {{ "chunk_index": 1, "image": "filename1.png" }},
-    {{ "chunk_index": 2, "image": "filename2.png" }}
+    {{ "chunk_index": 1, "image": "FILENAME_FROM_IMAGES_LIST" }},
+    {{ "chunk_index": 2, "image": "FILENAME_FROM_IMAGES_LIST" }}
   ]
 }}
-
-Rules:
-- "chunk_index" must match one of the CHUNKS indexes.
-- "image" must be exactly one of the filenames from IMAGES.
 """
 
     try:
@@ -403,8 +418,8 @@ Rules:
             model=model_id,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            max_completion_tokens=1024,
-            temperature=0.3,
+            max_completion_tokens=2048,
+            temperature=0.2,
         )
         text = resp.choices[0].message.content or "{}"
         data = json.loads(text)
@@ -416,15 +431,31 @@ Rules:
     if not isinstance(mappings, list):
         return [], data
 
-    valid_set = set(image_desc_map.keys())
+    valid_files = set(image_desc_map.keys())
+    valid_chunk_indexes = {c["index"] for c in chunks}
+
     cleaned = []
+    seen_chunks = set()
+
     for m in mappings:
         if not isinstance(m, dict):
             continue
         idx = m.get("chunk_index")
         img = m.get("image")
-        if isinstance(idx, int) and img in valid_set:
+        if (
+            isinstance(idx, int)
+            and idx in valid_chunk_indexes
+            and img in valid_files
+            and idx not in seen_chunks
+        ):
             cleaned.append({"chunk_index": idx, "image": img})
+            seen_chunks.add(idx)
+
+    if len(cleaned) < len(chunks):
+        st.warning(
+            f"⚠️ Groq mapping only returned {len(cleaned)} of {len(chunks)} chunks. "
+            "Missing chunks will use fallback later."
+        )
 
     return cleaned, data
 
@@ -434,11 +465,7 @@ Rules:
 # =========================
 
 def build_timeline_sequential(chunks, image_names, audio_duration=None, min_dur=0.5):
-    """
-    Simple deterministic fallback:
-    - Duration = Deepgram timestamps
-    - image = index-based rotation
-    """
+    """Simple deterministic fallback: chunk 1 → img 1, chunk 2 → img 2, etc."""
     if not chunks or not image_names:
         return []
 
@@ -461,10 +488,12 @@ def build_timeline_sequential(chunks, image_names, audio_duration=None, min_dur=
     return timeline
 
 
-def build_timeline_with_mapping(chunks, mappings, image_names, audio_duration=None, min_dur=0.5):
+def build_timeline_with_mapping(chunks, mappings, image_names,
+                                audio_duration=None, min_dur=0.5):
     """
     Mapping-based:
-    - If mapping missing / useless (all same image) → sequential fallback
+    - Agar mapping bekaar ho (sirf 1 image / 1 chunk / bohot kam coverage)
+      → sequential fallback
     """
     if not chunks or not image_names:
         return []
@@ -480,8 +509,15 @@ def build_timeline_with_mapping(chunks, mappings, image_names, audio_duration=No
             idx_to_img[idx] = img
 
     used_images = set(idx_to_img.values())
-    if len(used_images) <= 1 and len(image_names) > 1:
-        # sab ko ek hi image de diya? bakwaas → fallback
+    used_chunks = set(idx_to_img.keys())
+    coverage_ratio = len(used_chunks) / max(len(chunks), 1)
+
+    if (
+        len(used_images) <= 1
+        or len(used_chunks) <= 1
+        or coverage_ratio < 0.5
+    ):
+        st.warning("⚠️ Groq mapping looked degenerate, using sequential mapping instead.")
         return build_timeline_sequential(chunks, image_names, audio_duration, min_dur)
 
     timeline = []
@@ -636,23 +672,18 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
 # UI
 # =========================
 
-st.title("🤖 AI Video Generator (Deepgram + Groq, Full Debug)")
+st.title("🤖 AI Video Generator (Deepgram + Groq Vision/Text)")
 st.markdown(
     """
-**Pipeline:**
+**Pipeline Overview**
 
-1. Deepgram → voiceover ko **chunks + timestamps** me todta hai  
-2. Groq Vision → images ko batches of 5 me analyze karke **descriptions** banata hai (max ~50 images)  
-3. Groq Text → Deepgram chunks + image descriptions se **JSON mapping** banata hai (`chunk_index → image filename`)  
-4. Timeline → Deepgram ke time se **100% audio sync**, Groq se **image choice**  
-5. OpenCV + FFmpeg → final video render, zoom effect ke sath  
+1. **Deepgram** – Voiceover se transcript + timestamps + multiple chunks  
+2. **Groq Vision** – Har image pe: "What is in this image? What is happening?" (English description)  
+3. **Groq Text** – Voiceover chunks + image descriptions → semantic mapping (chunk → best image)  
+4. **Timeline** – Deepgram time se sync, Groq mapping + strong fallback  
+5. **OpenCV + FFmpeg** – Frames render + audio merge, progress + stop button  
 
-Neeche expanders me tum **har step ki JSON / data** dekh sakte ho:
-- Deepgram raw JSON
-- Chunks list
-- Image descriptions (Groq Vision)
-- Mapping JSON (Groq Text)
-- Final timeline
+Neeche expanders me har step ka JSON dekh sakte ho.
 """
 )
 
@@ -661,7 +692,7 @@ with col1:
     audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
 with col2:
     uploaded_images = st.file_uploader(
-        "Upload images (max ~50, order ≈ story flow)",
+        "Upload images (max ~50, story-related)",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
     )
@@ -674,7 +705,16 @@ if st.button("🚀 Generate video", type="primary"):
     if not audio_file or not uploaded_images:
         st.error("Please upload both audio and images first.")
     else:
-        # optional: cap images to e.g. 50
+        # ============ Init debug holders ============
+        deepgram_raw = None
+        image_desc_raw_list = []
+        image_desc_map = {}
+        mappings = []
+        mapping_raw = None
+        timeline = []
+        full_text = ""
+        chunks = []
+
         if len(uploaded_images) > 50:
             st.warning(
                 f"⚠️ {len(uploaded_images)} images uploaded. "
@@ -684,18 +724,10 @@ if st.button("🚀 Generate video", type="primary"):
 
         status = st.status("Starting process...", expanded=True)
 
-        deepgram_raw = None
-        image_desc_raw_list = []
-        image_desc_map = {}
-        mapping_raw = None
-        mappings = []
-        timeline = []
-
-        # 0) Clean temp
         status.write("🧹 Cleaning temp folder...")
         clean_temp_dir()
 
-        # 1) Save audio
+        # Save audio
         status.write("💾 Saving audio file...")
         local_audio = os.path.join(TEMP_DIR, "input.mp3")
         local_audio = os.path.abspath(local_audio)
@@ -717,7 +749,7 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Stopped by user.")
             st.stop()
 
-        # 2) Deepgram
+        # Deepgram
         status.write("👂 Getting transcript + timestamps (Deepgram)...")
         full_text, chunks, deepgram_raw = get_transcript_chunks(
             local_audio, audio_duration=audio_duration
@@ -729,7 +761,6 @@ if st.button("🚀 Generate video", type="primary"):
             status.write("⚠️ No chunks from Deepgram, falling back to simple slideshow.")
             dummy_chunks = []
             if audio_duration and image_names:
-                # ek simple chunk per image
                 avg_dur = audio_duration / max(len(image_names), 1)
                 t = 0.0
                 for i, name in enumerate(image_names, start=1):
@@ -743,8 +774,8 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Stopped by user.")
             st.stop()
 
-        # 3) Groq Vision: all image descriptions (batches of 5)
-        status.write("👁️ Describing ALL images with Groq Vision (batches of 5)...")
+        # Groq Vision: descriptions
+        status.write("👁️ Describing ALL images with Groq Vision...")
         image_desc_map, image_desc_raw_list = describe_all_images_with_groq(
             uploaded_images
         )
@@ -753,9 +784,9 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Stopped by user.")
             st.stop()
 
-        # 4) Groq Text: mapping using descriptions
+        # Groq Text: mapping
         if image_desc_map:
-            status.write("🧠 Mapping chunks → images using descriptions (Groq Text)...")
+            status.write("🧠 Mapping chunks → images (Groq Text)...")
             mappings, mapping_raw = map_chunks_to_images_using_descriptions(
                 chunks, image_desc_map
             )
@@ -775,7 +806,7 @@ if st.button("🚀 Generate video", type="primary"):
             st.warning("⛔ Stopped by user.")
             st.stop()
 
-        # 5) Render video
+        # Render video
         status.write("🎬 Rendering video with OpenCV + FFmpeg...")
         image_map = {img.name: img for img in uploaded_images}
         final_vid_path = render_video(timeline, local_audio, image_map)
@@ -790,13 +821,8 @@ if st.button("🚀 Generate video", type="primary"):
         else:
             st.success("Video rendered! You can watch or download it below.")
 
-        # Show + download
-        try:
-            with open(final_vid_path, "rb") as f:
-                video_bytes = f.read()
-        except Exception as e:
-            st.error(f"❌ Could not read final video file: {e}")
-            st.stop()
+        with open(final_vid_path, "rb") as f:
+            video_bytes = f.read()
 
         st.video(video_bytes)
 
@@ -807,9 +833,7 @@ if st.button("🚀 Generate video", type="primary"):
             mime="video/mp4",
         )
 
-        # =========================
-        # DEBUG / INSPECT SECTIONS
-        # =========================
+        # DEBUG PANELS
 
         with st.expander("🧩 Deepgram Output (raw JSON + chunks + transcript)"):
             st.subheader("Raw Deepgram JSON (full)")
@@ -820,9 +844,9 @@ if st.button("🚀 Generate video", type="primary"):
             st.json(chunks)
 
         with st.expander("👁️ Groq Vision – Image Descriptions"):
-            st.markdown("**Raw responses per batch (JSON exactly as Groq returned):**")
+            st.markdown("**Raw responses per image (JSON exactly as Groq returned):**")
             for idx, raw in enumerate(image_desc_raw_list, start=1):
-                st.markdown(f"**Batch {idx}**")
+                st.markdown(f"**Image {idx}**")
                 st.json(raw)
             st.subheader("Final aggregated map: filename → description")
             st.json(image_desc_map)
