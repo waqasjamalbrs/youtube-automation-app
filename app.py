@@ -287,183 +287,21 @@ def get_transcript_chunks(
 
 
 # =========================
-# NEW: GROUP CHUNKS INTO "VISUAL" SCENES (SEMANTIC MERGE)
-# =========================
-
-def _extract_json_from_text(text: str):
-    """Try to pull a JSON object out of LLM text safely."""
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # Fallback: substring between first { and last }
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(text[start:end + 1])
-        except Exception:
-            return None
-    return None
-
-
-def group_chunks_into_visual_scenes(chunks):
-    """
-    LLM se chunks ko merge karwa ke 'visual scenes' banao.
-
-    - Har chunk sirf EK scene ka part ho (no splitting).
-    - Scenes time-wise contiguous hon.
-    - Scene.text = us scene ke sare chunks ka ORIGINAL text concat (single spaces),
-      LLM ko clear instruction diya gaya hai ke text rewrite/paraphrase na kare.
-
-    Return:
-        scenes: list of {index, start, end, text}
-        raw_text: LLM ka raw string response
-    """
-    if not chunks:
-        return [], None
-
-    model_id = "meta-llama/llama-4-maverick-17b-128e-instruct"
-
-    # Full chunks as context (text already limited per chunk)
-    chunk_list = [
-        {
-            "index": c["index"],
-            "start": float(c["start"]),
-            "end": float(c["end"]),
-            "text": c["text"],
-        }
-        for c in chunks
-    ]
-
-    prompt = f"""
-You will be given a list of small voiceover CHUNKS.
-Each chunk has:
-- index (integer)
-- start (seconds)
-- end (seconds)
-- text (spoken words for that time range)
-
-Your task:
-- MERGE neighboring chunks into longer VISUAL SCENES.
-- A scene should represent one coherent visual moment (same place/time/action/emotion).
-- Do NOT break in the middle of a natural visual idea.
-- You must keep the original order. Do NOT reorder anything.
-- Every chunk must belong to exactly ONE scene.
-- A scene can contain 1 or more adjacent chunks.
-
-Rules for each scene:
-- index: assign 1, 2, 3, ... in order of time.
-- start: start time of the FIRST chunk in that scene.
-- end: end time of the LAST chunk in that scene.
-- text: concatenate the ORIGINAL text of all chunks in that scene in order,
-  separated by a single space. DO NOT rewrite, paraphrase, or remove words.
-  DO NOT add new words.
-
-Return ONLY JSON in this format:
-
-{{
-  "scenes": [
-    {{
-      "index": 1,
-      "start": 0.0,
-      "end": 5.2,
-      "text": "..."
-    }},
-    ...
-  ]
-}}
-
-Do NOT add any explanation outside the JSON.
-
-CHUNKS:
-{json.dumps(chunk_list, ensure_ascii=False, indent=2)}
-"""
-
-    try:
-        resp = groq_client.chat.completions.create(
-            model=model_id,
-            messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=4096,
-            temperature=0.2,
-        )
-        raw_text = resp.choices[0].message.content or ""
-    except Exception as e:
-        st.error(f"❌ Failed to group chunks into visual scenes: {e}")
-        return [], None
-
-    data = _extract_json_from_text(raw_text)
-    if not isinstance(data, dict) or "scenes" not in data:
-        st.warning("⚠️ Could not parse scene grouping JSON. Falling back to raw chunks.")
-        # fallback: each chunk is its own scene
-        fallback_scenes = [
-            {
-                "index": c["index"],
-                "start": float(c["start"]),
-                "end": float(c["end"]),
-                "text": c["text"],
-            }
-            for c in chunks
-        ]
-        return fallback_scenes, raw_text
-
-    scenes_raw = data.get("scenes", [])
-    scenes = []
-    for s in scenes_raw:
-        try:
-            idx = int(s["index"])
-            start = float(s["start"])
-            end = float(s["end"])
-            text = str(s["text"]).strip()
-        except Exception:
-            continue
-        if not text:
-            continue
-        scenes.append(
-            {
-                "index": idx,
-                "start": start,
-                "end": end,
-                "text": text,
-            }
-        )
-
-    if not scenes:
-        st.warning("⚠️ Scene grouping JSON empty. Falling back to raw chunks.")
-        fallback_scenes = [
-            {
-                "index": c["index"],
-                "start": float(c["start"]),
-                "end": float(c["end"]),
-                "text": c["text"],
-            }
-            for c in chunks
-        ]
-        return fallback_scenes, raw_text
-
-    # Ensure scenes sorted by index
-    scenes.sort(key=lambda x: x["index"])
-
-    return scenes, raw_text
-
-
-# =========================
-# TEXT MODEL: SCENES → IMAGE PROMPTS (PLAIN TEXT, GROQ LLAMA-4 MAVERICK)
+# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT, GROQ LLAMA-4 MAVERICK)
 # =========================
 
 def generate_image_prompts_for_chunks(chunks):
     """
-    Ab yahan 'chunks' actually visual SCENES bhi ho sakte hain.
-    Har item ke liye ek image-generation prompt.
-
+    Har chunk ke liye ek image-generation prompt.
     Model se output **plain text** me lenge, JSON nahi.
-    Format:
+    Format jo hum expect kar rahe hain:
 
       Scene 1: cinematic prompt...
       Scene 2: another prompt...
+      Scene 3: ...
 
     Return:
-        prompts_map: {scene_index: prompt_str}
+        prompts_map: {chunk_index: prompt_str}
         raw_text: str (model ka raw response)
     """
     if not chunks:
@@ -489,29 +327,29 @@ def generate_image_prompts_for_chunks(chunks):
     prompt = f"""
 You are an expert cinematic storyboard artist.
 
-You receive a list of narration SCENES from a voiceover, each with:
+You receive a list of narration CHUNKS from a voiceover, each with:
 - index
 - start time (seconds)
 - end time (seconds)
-- text (the spoken line(s) in that part of the story)
+- text (the spoken line in that part of the story)
 
-Your job is to create ONE image-generation prompt PER scene.
+Your job is to create ONE image-generation prompt PER chunk.
 
 Goals:
-- Each prompt must closely match the meaning and mood of that scene.
+- Each prompt must closely match the meaning and mood of that chunk.
 - Imagine this is for a cinematic video.
 - Use clear, specific English.
 - You can mention camera / composition / lighting when helpful
   (e.g. "wide shot", "close-up", "cinematic lighting", "dramatic shadows").
-- Do NOT mention the word "scene", "voiceover", "caption", or any subtitles.
+- Do NOT mention the word "chunk", "voiceover", "caption", or any subtitles.
 - Do NOT add anything about on-screen text or UI.
 - Keep each prompt as a single sentence or short paragraph focused on visuals only.
 
-SCENES:
+CHUNKS:
 {json.dumps(chunks_brief, ensure_ascii=False, indent=2)}
 
 RESPONSE FORMAT (TEXT ONLY, NO JSON):
-- For EACH scene, write exactly ONE line in this format:
+- For EACH chunk, write exactly ONE line in this format:
   Scene <index>: <image prompt>
 
 Examples of lines:
@@ -519,9 +357,9 @@ Examples of lines:
   Scene 2: close-up of a worried mother holding her child in a small apartment
 
 Rules:
-- Use the exact word "Scene" (capital S), then a space, then the index,
+- Use the exact word "Scene" (capital S), then a space, then the chunk index,
   then a colon, then a space, then the prompt.
-- EXACTLY one line per index.
+- EXACTLY one line per chunk index.
 - Do not add any extra commentary before or after the list.
 - Do not use JSON.
 """
@@ -550,7 +388,7 @@ Rules:
             if pmt:
                 prompts_map[idx] = pmt
 
-    # Strict: har scene k liye prompt required
+    # Strict: har chunk k liye prompt required
     expected_indexes = {c["index"] for c in chunks}
     missing = sorted(list(expected_indexes - set(prompts_map.keys())))
     if missing:
@@ -742,17 +580,19 @@ def render_video_from_scenes(
         return None
 
     st.write("🎵 Merging audio with video...")
+    # ✅ CHANGED: re-encode to H.264 + yuv420p for WhatsApp/YouTube compatibility
     command = [
         "ffmpeg",
         "-y",
-        "-i",
-        temp_video_abs,
-        "-i",
-        audio_abs,
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
+        "-i", temp_video_abs,
+        "-i", audio_abs,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
         "-shortest",
         final_output_abs,
     ]
@@ -799,9 +639,6 @@ if "transcription_raw" not in st.session_state:
 
 if "prompt_raw" not in st.session_state:
     st.session_state.prompt_raw = None
-
-if "scene_grouping_raw" not in st.session_state:
-    st.session_state.scene_grouping_raw = None
 
 # =========================
 # SIDEBAR SETTINGS
@@ -869,13 +706,12 @@ if reset:
     st.session_state.audio_duration = None
     st.session_state.transcription_raw = None
     st.session_state.prompt_raw = None
-    st.session_state.scene_grouping_raw = None
     st.session_state.stop_requested = False
     st.success("State cleared.")
     st.stop()
 
 # =========================
-# STEP 1: ANALYZE (TRANSCRIPT + SCENES + PROMPTS + AUTO IMAGES)
+# STEP 1: ANALYZE (TRANSCRIPT + PROMPTS + AUTO IMAGES)
 # =========================
 
 if analyze:
@@ -913,7 +749,7 @@ if analyze:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # Transcription (words + small chunks)
+    # Transcription (no enforced 5s max, default settings)
     status.write("👂 Getting transcript + timestamps...")
     full_text, chunks, raw = get_transcript_chunks(
         local_audio, audio_duration=audio_duration
@@ -921,29 +757,16 @@ if analyze:
     st.session_state.transcription_raw = raw
 
     if not chunks:
-        st.error("❌ No scenes/chunks found from voiceover.")
+        st.error("❌ No scenes found from voiceover.")
         st.stop()
 
     if st.session_state.stop_requested:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # NEW: group chunks into higher-level visual scenes
-    status.write("🎬 Grouping chunks into visual scenes (semantic beats)...")
-    visual_scenes, scene_group_raw = group_chunks_into_visual_scenes(chunks)
-    st.session_state.scene_grouping_raw = scene_group_raw
-
-    if not visual_scenes:
-        st.error("❌ Scene grouping failed.")
-        st.stop()
-
-    if st.session_state.stop_requested:
-        st.warning("⛔ Stopped by user.")
-        st.stop()
-
-    # Text model: prompts (Groq Llama-4 Maverick) per visual scene
+    # Text model: prompts (Groq Llama-4 Maverick)
     status.write("🧠 Generating image prompts for each scene (Groq Llama-4 Maverick)...")
-    prompts_map, prompt_raw = generate_image_prompts_for_chunks(visual_scenes)
+    prompts_map, prompt_raw = generate_image_prompts_for_chunks(chunks)
     st.session_state.prompt_raw = prompt_raw
 
     if not prompts_map:
@@ -952,7 +775,7 @@ if analyze:
 
     # Build scenes (text + prompts)
     scenes = []
-    for c in visual_scenes:
+    for c in chunks:
         idx = c["index"]
         scenes.append(
             {
@@ -965,6 +788,13 @@ if analyze:
                 "image_data": None,
             }
         )
+
+    # ✅ NEW: ensure last scene reaches full audio duration (avoid tail cut)
+    if st.session_state.audio_duration and scenes:
+        ad = float(st.session_state.audio_duration)
+        # only extend if noticeably shorter
+        if scenes[-1]["end"] < ad - 0.05:
+            scenes[-1]["end"] = ad
 
     # Auto-generate images for all scenes right here
     status.write("🖼️ Generating images for all scenes...")
@@ -1016,7 +846,7 @@ if scenes:
     st.subheader("Scene Prompts & Images (Editing)")
 
     st.caption(
-        "Har scene voiceover ke ek visual beat se linked hai. Prompt edit karo, phir image generate / regenerate karo."
+        "Har scene voiceover se linked hai. Prompt edit karo, phir image generate / regenerate karo."
     )
 
     # Optional: Bulk generate for scenes without image (fallback)
@@ -1219,16 +1049,10 @@ if scenes:
 # =========================
 
 if st.session_state.transcription_raw:
-    with st.expander("🧩 Transcription Output (raw JSON)", expanded=False):
+    with st.expander("🧩 Transcription Output (raw JSON + scenes)", expanded=False):
         st.subheader("Raw transcription JSON")
         st.json(st.session_state.transcription_raw)
-
-if st.session_state.scene_grouping_raw:
-    with st.expander("🎬 Scene grouping (raw model JSON)", expanded=False):
-        st.text(st.session_state.scene_grouping_raw)
-
-if st.session_state.scenes:
-    with st.expander("🎞️ Final scenes (index, start, end, text)", expanded=False):
+        st.subheader("Scenes (index, start, end, text)")
         st.json(
             [
                 {
