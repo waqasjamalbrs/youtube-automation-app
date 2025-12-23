@@ -166,7 +166,6 @@ def get_transcript_chunks(
     audio_duration=None,
     max_gap=1.5,
     max_words_per_chunk=25,
-    max_chunk_duration=5.0,  # <= MAX ~5s PER SCENE
 ):
     """
     Transcription API:
@@ -175,7 +174,6 @@ def get_transcript_chunks(
     - splits words into chunks (segments):
         - if there is a large silence gap
         - OR too many words
-        - OR chunk duration exceeds max_chunk_duration
 
     Return:
         full_text (str),
@@ -245,10 +243,10 @@ def get_transcript_chunks(
 
         gap = start - prev_end
         current_duration = prev_end - current_start
-        too_long = current_duration >= max_chunk_duration
         too_many_words = len(current_words) >= max_words_per_chunk
 
-        if (gap > max_gap or too_long or too_many_words) and current_words:
+        # Split only on silence or too many words
+        if (gap > max_gap or too_many_words) and current_words:
             chunk_text = " ".join(current_words).strip()
             chunks.append(
                 {
@@ -446,7 +444,7 @@ def generate_image_from_prompt(prompt, aspect_ratio, mode_label, api_key, timeou
 
 
 # =========================
-# VIDEO RENDERING FROM SCENES (100% SYNC)
+# VIDEO RENDERING FROM SCENES (STRICT FRAME TIMELINE)
 # =========================
 
 def render_video_from_scenes(
@@ -469,9 +467,10 @@ def render_video_from_scenes(
           "image_data": bytes
         }
 
-    Sync:
-        - duration = end - start (no rescaling, no fallback)
-        - strict frame counts based on durations
+    Sync strategy:
+        - Convert each scene's start/end timestamps to frame indices.
+        - Ensure scenes are contiguous in frame space.
+        - Adjust the last scene so that total video frames match audio length (if known).
     """
     if not scenes:
         st.error("No scenes to render.")
@@ -485,21 +484,49 @@ def render_video_from_scenes(
     width, height = 854, 480
     fps = 24
 
-    # Precompute durations and frames per scene
-    durations = [max(float(sc["end"] - sc["start"]), 0.2) for sc in scenes]
-    frames_per_scene = [max(int(round(d * fps)), 1) for d in durations]
+    # If audio_duration not passed, compute here
+    if audio_duration is None:
+        audio_duration = get_audio_duration(audio_path)
 
-    # Target total frames based on audio duration (if available)
+    # Compute frame ranges per scene using timestamps
+    frames_per_scene: List[int] = []
+    prev_end_frame = 0
+
+    for sc in scenes:
+        start_s = float(sc["start"])
+        end_s = float(sc["end"])
+
+        start_f = int(round(start_s * fps))
+        end_f = int(round(end_s * fps))
+
+        # Ensure monotonic non-overlapping frames
+        if start_f < prev_end_frame:
+            start_f = prev_end_frame
+        if end_f <= start_f:
+            end_f = start_f + 1
+
+        frames_in_scene = end_f - start_f
+        frames_per_scene.append(frames_in_scene)
+        prev_end_frame = end_f
+
+    # Adjust last scene frames to match audio total length (if we know it)
     if audio_duration is not None and audio_duration > 0:
-        total_frames_target = max(int(round(audio_duration * fps)), 1)
-    else:
-        total_frames_target = sum(frames_per_scene)
+        target_total_frames = max(int(round(audio_duration * fps)), 1)
+        current_total_frames = sum(frames_per_scene)
 
-    # Adjust last scene frames to match total target (to avoid cumulative drift)
-    current_sum = sum(frames_per_scene)
-    diff = total_frames_target - current_sum
-    if diff != 0:
-        frames_per_scene[-1] = max(frames_per_scene[-1] + diff, 1)
+        if current_total_frames < target_total_frames:
+            # Extend last scene
+            extra = target_total_frames - current_total_frames
+            frames_per_scene[-1] += extra
+        elif current_total_frames > target_total_frames:
+            # Shorten last scene (at least 1 frame)
+            reduce_by = min(
+                current_total_frames - target_total_frames,
+                frames_per_scene[-1] - 1,
+            )
+            frames_per_scene[-1] -= reduce_by
+
+    total_frames_all = sum(frames_per_scene)
 
     temp_video = os.path.join(TEMP_DIR, "temp_silent.mp4")
     final_output = os.path.join(TEMP_DIR, output_name)
@@ -515,10 +542,9 @@ def render_video_from_scenes(
     progress_bar = st.progress(0)
     percent_text = st.empty()
 
-    total_frames_all = sum(frames_per_scene)
     current_frame = 0
 
-    for sc, frames_in_clip, duration in zip(scenes, frames_per_scene, durations):
+    for sc, frames_in_clip in zip(scenes, frames_per_scene):
         if st.session_state.stop_requested:
             st.warning("⛔ Stopped during rendering.")
             out.release()
@@ -738,10 +764,11 @@ if analyze:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # Transcription  (WITH 5s MAX CHUNKS)
+    # Transcription (no hard 5s limit, only silence/word-based)
     status.write("Getting transcript and timestamps...")
     full_text, chunks, raw = get_transcript_chunks(
-        local_audio, audio_duration=audio_duration, max_chunk_duration=5.0
+        local_audio,
+        audio_duration=audio_duration,
     )
     st.session_state.transcription_raw = raw
 
