@@ -1,1227 +1,735 @@
 import os
-import re
+import io
 import json
 import time
 import shutil
 import tempfile
-import subprocess
-from typing import List, Tuple
-from urllib.parse import urljoin
+from typing import List, Dict, Any
 
 import requests
-import streamlit as st
-import cv2
 import numpy as np
+import cv2
 from groq import Groq
+from PIL import Image
 
-# =========================
-# PAGE CONFIG
-# =========================
+import streamlit as st
 
+# -------------------------------------------------
+# Page & temp setup
+# -------------------------------------------------
 st.set_page_config(
-    page_title="AI Video Generator",
+    page_title="AI Synced Video Builder",
     page_icon="🎬",
     layout="wide",
 )
 
-# =========================
-# STOP FLAG
-# =========================
-
-if "stop_requested" not in st.session_state:
-    st.session_state.stop_requested = False
-
-
-def request_stop():
-    st.session_state.stop_requested = True
-
-
-# =========================
-# SECRETS / KEYS
-# =========================
-
-# Transcription API key
-try:
-    DEEPGRAM_KEY = st.secrets["DEEPGRAM_API_KEY"]
-except Exception:
-    st.error("🚨 Please add DEEPGRAM_API_KEY in Streamlit secrets.")
-    st.stop()
-
-# Text model API key (Groq)
-GROQ_KEY = st.secrets.get("GROQ_API_KEY")
-if not GROQ_KEY:
-    st.error("🚨 Please add GROQ_API_KEY in Streamlit secrets.")
-    st.stop()
-
-groq_client = Groq(api_key=GROQ_KEY)
-
-# Image API key
-IMAGE_API_KEY = st.secrets.get("YOUSMIND_API_KEY")
-if not IMAGE_API_KEY:
-    st.error("🚨 Please add image API key in Streamlit secrets as YOUSMIND_API_KEY.")
-    st.stop()
-
-# Internal image API URL (hidden from UI name)
-IMAGE_API_URL = "https://yousmind.com/api/image-generator/generate"
-
-# =========================
-# TEMP DIR
-# =========================
-
-BASE_TEMP_DIR = os.path.join(tempfile.gettempdir(), "ai_video_app")
+BASE_TEMP_DIR = "temp_processing"
+if os.path.exists(BASE_TEMP_DIR):
+    shutil.rmtree(BASE_TEMP_DIR)
 os.makedirs(BASE_TEMP_DIR, exist_ok=True)
-TEMP_DIR = BASE_TEMP_DIR
 
-
-def clean_temp_dir():
-    """Har run se pehle temp dir ke andar ki purani files clean kar do."""
-    if not os.path.exists(TEMP_DIR):
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        return
-    for name in os.listdir(TEMP_DIR):
-        path = os.path.join(TEMP_DIR, name)
-        try:
-            if os.path.isfile(path) or os.path.islink(path):
-                os.remove(path)
-            elif os.path.isdir(path):
-                shutil.rmtree(path)
-        except Exception:
-            pass
-
-
-# =========================
-# UTILS
-# =========================
-
-FILENAME_SAFE = re.compile(r"[^a-zA-Z0-9_\-]+")
-
-
-def safe_name(s: str, max_len: int = 60) -> str:
-    """Convert a prompt into a safe file name."""
-    s = s.strip().replace(" ", "_")
-    s = FILENAME_SAFE.sub("", s)
-    return (s[:max_len] or "prompt").strip("_")
-
-
-def get_audio_duration(audio_path: str):
-    """ffprobe se audio ki duration (seconds) nikal lo."""
+# -------------------------------------------------
+# Secrets / keys
+# -------------------------------------------------
+def get_secret(name: str, fallback: str = None) -> str:
     try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                audio_path,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
-        )
-        return float(result.stdout.strip())
+        if name in st.secrets:
+            return st.secrets[name]
     except Exception:
-        return None
+        pass
+    if fallback and fallback in st.secrets:
+        return st.secrets[fallback]
+    return None
 
+DEEPGRAM_KEY = get_secret("DEEPGRAM_API_KEY")
+GROQ_KEY = get_secret("GROQ_API_KEY")
+IMAGE_API_KEY = get_secret("IMAGE_API_KEY", fallback="YOUSMIND_API_KEY")
+IMAGE_API_URL = get_secret("IMAGE_API_URL") or "https://yousmind.com/api/image-generator/generate"
 
-def download_image(url: str, timeout: int = 60) -> Tuple[str, bytes]:
-    """Download an image from a URL."""
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
+if not DEEPGRAM_KEY or not GROQ_KEY or not IMAGE_API_KEY:
+    st.error(
+        "Secrets missing! Please set `DEEPGRAM_API_KEY`, `GROQ_API_KEY` and "
+        "`IMAGE_API_KEY` (or `YOUSMIND_API_KEY`) in `.streamlit/secrets.toml`."
+    )
+    st.stop()
 
-    ext = "png"
-    lower = url.lower()
-    if ".jpg" in lower or ".jpeg" in lower:
-        ext = "jpg"
-    elif ".gif" in lower:
-        ext = "gif"
-    elif ".webp" in lower:
-        ext = "webp"
-    else:
-        ct = (r.headers.get("content-type") or "").lower()
-        if "jpeg" in ct or "jpg" in ct:
-            ext = "jpg"
-        elif "gif" in ct:
-            ext = "gif"
-        elif "webp" in ct:
-            ext = "webp"
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+def save_uploaded_file(uploaded, folder: str, filename: str) -> str:
+    """Save an uploaded file to disk and return path."""
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, filename)
+    with open(path, "wb") as f:
+        f.write(uploaded.getbuffer())
+    return path
 
-    return ext, r.content
-
-
-# =========================
-# TRANSCRIPTION: TRANSCRIPT + CHUNKS
-# =========================
-
-def get_transcript_chunks(
-    audio_path,
-    audio_duration=None,
-    max_gap=1.5,
-    max_words_per_chunk=25,
-    max_chunk_duration=5.0,  # ~max 5 sec scenes
-):
-    """
-    Transcription API:
-    - full transcript
-    - word timestamps
-    - words ko chunks (segments) me todta hai:
-        - agar words ke beech bohot gap ho (silence)
-        - YA words count zyada ho jaye
-        - YA chunk ki duration bohot badi ho jaye
-
-    Return:
-        full_text (str),
-        chunks = [
-          {"index": 1, "text": "...", "start": 0.5, "end": 5.2},
-          ...
-        ],
-        raw (dict)
-    """
+# -------------------------------------------------
+# 1. Deepgram – transcript + timestamps + 5s chunks
+# -------------------------------------------------
+def deepgram_transcribe(audio_path: str) -> Dict[str, Any]:
+    """Call Deepgram REST API and return JSON response."""
     url = "https://api.deepgram.com/v1/listen"
-
+    params = {
+        "model": "nova-2",
+        "smart_format": "true",
+        "punctuate": "true",
+        "diarize": "false",
+        "paragraphs": "true",
+    }
     headers = {
         "Authorization": f"Token {DEEPGRAM_KEY}",
         "Content-Type": "audio/mpeg",
     }
 
-    params = {
-        "model": "nova-2",
-        "smart_format": "true",
-        "punctuate": "true",
-        "utterances": "false",
-        "diarize": "false",
-    }
+    with open(audio_path, "rb") as f:
+        data = f.read()
 
-    try:
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
+    resp = requests.post(url, headers=headers, params=params, data=data, timeout=180)
+    resp.raise_for_status()
+    return resp.json()
 
-        resp = requests.post(url, headers=headers, params=params, data=audio_data)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        st.error(f"❌ Transcription request failed: {e}")
-        return "", [], None
 
-    try:
-        alt = data["results"]["channels"][0]["alternatives"][0]
-    except Exception as e:
-        st.error(f"❌ Unexpected transcription response format: {e}")
-        st.write(data)
-        return "", [], data
-
-    full_text = alt.get("transcript", "").strip()
-    words = alt.get("words", [])
-
+def build_chunks_from_words(words: List[Dict[str, Any]], max_chunk_sec: float = 5.0) -> List[Dict[str, Any]]:
+    """
+    Make time-based chunks from Deepgram word list.
+    Each chunk ~ <= max_chunk_sec, 100% time-sync.
+    """
     if not words:
-        if not audio_duration:
-            return full_text, [], data
-        return full_text, [
-            {
-                "index": 1,
-                "text": full_text,
-                "start": 0.0,
-                "end": float(audio_duration),
-            }
-        ], data
+        return []
 
     chunks = []
-    current_words = []
-    current_start = words[0]["start"]
-    prev_end = words[0]["end"]
+    cur_words = []
+    cur_start = words[0]["start"]
+    last_end = cur_start
 
     for w in words:
-        word = w.get("word", "")
-        start = w.get("start", prev_end)
-        end = w.get("end", start)
-
-        gap = start - prev_end
-        current_duration = prev_end - current_start
-        too_long = current_duration >= max_chunk_duration
-        too_many_words = len(current_words) >= max_words_per_chunk
-
-        if (gap > max_gap or too_long or too_many_words) and current_words:
-            chunk_text = " ".join(current_words).strip()
+        w_start = w["start"]
+        w_end = w["end"]
+        last_end = w_end
+        cur_words.append(w["word"])
+        # if this word pushes us past max_chunk_sec → close the chunk
+        if (w_end - cur_start) >= max_chunk_sec:
             chunks.append(
                 {
-                    "index": len(chunks) + 1,
-                    "text": chunk_text,
-                    "start": current_start,
-                    "end": prev_end,
+                    "text": " ".join(cur_words).strip(),
+                    "start": float(cur_start),
+                    "end": float(w_end),
                 }
             )
-            current_words = [word]
-            current_start = start
-        else:
-            current_words.append(word)
+            cur_words = []
+            cur_start = w_end
 
-        prev_end = end
-
-    if current_words:
-        chunk_text = " ".join(current_words).strip()
+    # remaining tail
+    if cur_words:
         chunks.append(
             {
-                "index": len(chunks) + 1,
-                "text": chunk_text,
-                "start": current_start,
-                "end": prev_end,
+                "text": " ".join(cur_words).strip(),
+                "start": float(cur_start),
+                "end": float(last_end),
             }
         )
 
-    if audio_duration and chunks:
-        # last chunk ko audio ke end ke sath thoda align rakhna
-        if chunks[-1]["end"] > audio_duration + 0.3:
-            chunks[-1]["end"] = float(audio_duration)
-        elif chunks[-1]["end"] < audio_duration - 0.5:
-            chunks[-1]["end"] = float(audio_duration)
+    # make sure duration > 0
+    for c in chunks:
+        if c["end"] <= c["start"]:
+            c["end"] = c["start"] + 0.5
 
-    return full_text, chunks, data
+    # add index for UI
+    for i, c in enumerate(chunks, start=1):
+        c["index"] = i
+
+    return chunks
 
 
-# =========================
-# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT + STYLE) WITH BATCHING
-# =========================
-
-def generate_image_prompts_for_chunks(chunks, global_style_text: str = ""):
+def extract_words_from_deepgram(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Har chunk ke liye ek image-generation prompt.
-    Output: plain text, JSON nahi.
-
-    Expected format from Groq:
-
-      Scene 1: cinematic prompt...
-      Scene 2: another prompt...
-      ...
-
-    global_style_text → e.g. "black and white, high contrast, documentary style"
-
-    Batching + fallback:
-      - Groq ko batches me call karte hain (default 15 scenes per call)
-      - Agar model kuch scenes skip kar de, un ke liye simple fallback prompt bana dete hain
+    Safely pull word list from Deepgram response.
     """
-    if not chunks:
-        return {}, None
+    try:
+        alt = resp["results"]["channels"][0]["alternatives"][0]
+    except Exception:
+        return []
 
-    model_id = "llama-3.1-8b-instant"
-    batch_size = 15  # 15 scenes per Groq call, lambi audio ke liye safe
+    if "words" in alt:
+        return alt["words"]
 
-    def call_model_for_subset(sub_chunks):
-        """Ek subset of chunks (list) ke liye Groq se prompts mangta hai."""
-        chunks_brief = []
-        for c in sub_chunks:
-            text = c.get("text", "")
-            if len(text) > 400:
-                text = text[:400] + "..."
-            chunks_brief.append(
-                {
-                    "index": c["index"],  # global scene index
-                    "start": round(float(c["start"]), 2),
-                    "end": round(float(c["end"]), 2),
-                    "text": text,
-                }
-            )
+    # Fallback: construct single chunk over full transcript
+    start = 0.0
+    end = float(alt.get("duration", 0.0) or 5.0)
+    return [{"word": alt.get("transcript", ""), "start": start, "end": end}]
 
-        style_instruction = ""
-        if global_style_text:
-            style_instruction = f"""
-GLOBAL STYLE PREFERENCE:
-The user wants all images in this style: "{global_style_text}".
-Make sure every scene prompt explicitly reflects this visual style.
-"""
+# -------------------------------------------------
+# 2. Groq – scene prompts for each chunk
+# -------------------------------------------------
+def groq_scene_prompts(chunks: List[Dict[str, Any]], global_style: str) -> List[str]:
+    """
+    Ask Groq to generate one image prompt per chunk.
+    Returns list of prompts (len == len(chunks)).
+    """
+    client = Groq(api_key=GROQ_KEY)
 
-        prompt = f"""
-You are an AI storyboard artist for a video.
-
-You receive a list of narration CHUNKS from a voiceover, each with:
-- index
-- start time (seconds)
-- end time (seconds)
-- text (the spoken line in that part of the story)
-
-Your job is to create ONE image-generation prompt PER chunk.
-
-Goals:
-- Each prompt should visually represent the meaning of that chunk.
-- Imagine this is for a cinematic video.
-- Use clear, specific English.
-- You can mention camera / composition / lighting when helpful
-  (e.g. "wide shot", "close-up", "cinematic lighting", "dramatic shadows").
-- Do NOT mention the word "chunk", "voiceover", "caption", or any subtitles.
-- Do NOT add anything about on-screen text or UI.
-
-{style_instruction}
-
-CHUNKS:
-{json.dumps(chunks_brief, ensure_ascii=False, indent=2)}
-
-RESPONSE FORMAT (TEXT ONLY, NO JSON):
-- For EACH chunk, write exactly ONE line in this format:
-  Scene <index>: <image prompt>
-
-Examples of lines:
-  Scene 1: wide shot of a busy city at night, cinematic lighting, blue and orange colors
-  Scene 2: close-up of a worried mother holding her child in a small apartment
-
-Rules:
-- Use the exact word "Scene" (capital S), then a space, then the chunk index,
-  then a colon, then a space, then the prompt.
-- EXACTLY one line per chunk index.
-- Do not add any extra commentary before or after the list.
-- Do not use JSON.
-"""
-
-        try:
-            resp = groq_client.chat.completions.create(
-                model=model_id,
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=2048,
-                temperature=0.4,
-            )
-            text = resp.choices[0].message.content or ""
-        except Exception as e:
-            # Agar pura batch hi fail ho jaye to empty return karein,
-            # baad me fallback prompts use kar lenge.
-            st.error(f"❌ Failed to generate image prompts for a batch: {e}")
-            return {}, ""
-
-        # Parse lines: Scene <index>: <prompt>
-        local_map = {}
-        for line in text.splitlines():
-            m = re.match(r"\s*Scene\s+(\d+)\s*:\s*(.+)", line, re.IGNORECASE)
-            if m:
-                idx = int(m.group(1))
-                pmt = m.group(2).strip()
-                if pmt:
-                    local_map[idx] = pmt
-
-        return local_map, text
-
-    # ---- Batching over all chunks ----
-    all_prompts_map = {}
-    raw_text_pieces = []
-
-    for i in range(0, len(chunks), batch_size):
-        sub = chunks[i: i + batch_size]
-        local_map, raw_text = call_model_for_subset(sub)
-        all_prompts_map.update(local_map)
-        if raw_text:
-            raw_text_pieces.append(f"=== BATCH {i // batch_size + 1} ===\n{raw_text}")
-
-    raw_text_all = "\n\n".join(raw_text_pieces) if raw_text_pieces else None
-
-    # ---- Fallback for missing scenes ----
-    expected_indexes = {c["index"] for c in chunks}
-    missing = sorted(list(expected_indexes - set(all_prompts_map.keys())))
-
-    if missing:
-        st.warning(
-            f"⚠️ Groq did not return prompts for these scene indexes: {missing}. "
-            "Using simple fallback prompts based on the scene text. "
-            "You can edit them in the UI before generating images."
+    # Build a concise description for Groq
+    parts = []
+    for c in chunks:
+        parts.append(
+            f"Scene {c['index']} ({c['start']:.2f}s–{c['end']:.2f}s): {c['text']}"
         )
+    joined = "\n".join(parts)
 
-        for idx in missing:
-            chunk = next((c for c in chunks if c["index"] == idx), None)
-            if not chunk:
-                continue
-            txt = chunk.get("text", "")
-            txt_short = (txt[:160] + "...") if len(txt) > 160 else txt
+    style_suffix = ""
+    if global_style:
+        style_suffix = f" The overall visual style should be: {global_style}."
 
-            base_prompt = f"cinematic illustration of: {txt_short}"
-            if global_style_text:
-                base_prompt = base_prompt.rstrip(".") + f", {global_style_text}"
+    system_msg = (
+        "You are an expert storyboard artist for videos. "
+        "Given scenes of narration, you write one DALL·E / SD-style image prompt "
+        "for each scene, describing what should be shown visually."
+    )
 
-            all_prompts_map[idx] = base_prompt
+    user_msg = (
+        "Here is the narration split into numbered scenes with their timings:\n\n"
+        f"{joined}\n\n"
+        "Write ONE image prompt per scene, in English.\n"
+        f"{style_suffix}\n\n"
+        "Respond ONLY as plain text in this exact format (no JSON, no markdown):\n"
+        "Scene 1: <prompt text>\n"
+        "Scene 2: <prompt text>\n"
+        "Scene 3: <prompt text>\n"
+        "...\n"
+        "Use the same scene numbers that I provided."
+    )
 
-    # Extra safety: ensure style suffix present
-    if global_style_text:
-        suffix = ", " + global_style_text
-        for idx, p in list(all_prompts_map.items()):
-            if global_style_text.lower() not in p.lower():
-                all_prompts_map[idx] = p.rstrip(".") + suffix
+    completion = client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.6,
+        max_completion_tokens=2048,
+        top_p=1,
+    )
 
-    return all_prompts_map, raw_text_all
+    raw_text = completion.choices[0].message.content.strip()
 
+    # Parse "Scene X: prompt"
+    prompts_by_index = {}
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.lower().startswith("scene"):
+            continue
+        # Expected: "Scene N: prompt..."
+        try:
+            label, prompt = line.split(":", 1)
+        except ValueError:
+            continue
+        label = label.strip().lower()
+        prompt = prompt.strip()
+        # extract index
+        idx = None
+        for token in label.split():
+            if token.isdigit():
+                idx = int(token)
+                break
+        if idx is not None and prompt:
+            prompts_by_index[idx] = prompt
 
-# =========================
-# IMAGE API: SINGLE IMAGE PER PROMPT
-# =========================
+    # Build a final list aligned with chunks; fallback = generic from text
+    prompts = []
+    for c in chunks:
+        idx = c["index"]
+        base_prompt = prompts_by_index.get(
+            idx,
+            f"An illustrative shot matching this narration: {c['text']}",
+        )
+        prompts.append(base_prompt)
 
-def generate_image_from_prompt(prompt, aspect_ratio, mode_label, api_key, timeout=60):
+    return prompts
+
+# -------------------------------------------------
+# 3. Image generation API (generic engine)
+# -------------------------------------------------
+def call_image_engine(prompt: str, aspect_ratio: str, engine_name: str) -> bytes:
     """
-    Image API wrapper:
-    - Prompt is ALWAYS plain text string.
-    - Returns: (filename, image_bytes, raw_response_dict)
+    Calls external image engine API and returns raw image bytes.
+    We only ask for 1 image per prompt.
     """
     headers = {
         "Content-Type": "application/json",
-        "X-API-Key": api_key,
+        "X-API-Key": IMAGE_API_KEY,
     }
     payload = {
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
-        "provider": mode_label,
+        "provider": engine_name,
         "n": 1,
     }
 
-    r = requests.post(IMAGE_API_URL, headers=headers, json=payload, timeout=timeout)
+    resp = requests.post(IMAGE_API_URL, headers=headers, json=payload, timeout=180)
     try:
-        data = r.json()
+        data = resp.json()
     except Exception:
-        data = {"raw_text": r.text}
+        raise RuntimeError(f"Image API returned non-JSON: {resp.text[:300]}")
 
-    if r.status_code != 200:
+    if resp.status_code != 200:
         raise RuntimeError(
-            f"HTTP {r.status_code} | Response: {str(data)[:400]}"
+            f"Image API HTTP {resp.status_code}: {str(data)[:300]}"
         )
 
-    urls = data.get("image_urls", [])
+    urls = data.get("image_urls") or []
     if not urls:
-        raise RuntimeError(
-            f"No image_urls in response: {str(data)[:400]}"
-        )
+        raise RuntimeError(f"No image_urls in response: {str(data)[:300]}")
 
     url = urls[0]
     if not url.lower().startswith("http"):
+        from urllib.parse import urljoin
         url = urljoin(IMAGE_API_URL, url)
 
-    ext, raw = download_image(url, timeout=timeout)
-    filename = f"{safe_name(prompt)}.{ext}"
-    return filename, raw, data
+    img_resp = requests.get(url, timeout=180)
+    img_resp.raise_for_status()
+    return img_resp.content
 
-
-# =========================
-# VIDEO RENDERING FROM SCENES (100% SYNC)
-# =========================
-
-def apply_color_and_grain(frame, color_mode, film_grain, grain_strength):
-    """Black & white conversion + film grain noise."""
-    img = frame
-
-    # Black & white
-    if color_mode == "Black & white":
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-    # Film grain / noise
-    if film_grain and grain_strength > 0:
-        noise = np.random.normal(
-            0,
-            grain_strength,
-            img.shape
-        ).astype(np.float32)
-        noisy = img.astype(np.float32) + noise
-        img = np.clip(noisy, 0, 255).astype(np.uint8)
-
-    return img
-
-
-def render_video_from_scenes(
-    scenes,
-    audio_path,
-    output_name="final_video.mp4",
-    color_mode="Full color",
-    film_grain=False,
-    grain_strength=10,
-    zoom_strength=0.05,
-):
+# -------------------------------------------------
+# 4. Video rendering (OpenCV + ffmpeg)
+# -------------------------------------------------
+def render_video(
+    scenes: List[Dict[str, Any]],
+    audio_path: str,
+    color_mode: str = "Color",
+    zoom_strength: float = 0.05,
+    fps: int = 24,
+    resolution=(854, 480),
+) -> str:
     """
-    Scenes: list of dicts:
-        {
-          "index": int,
-          "start": float,
-          "end": float,
-          "text": str,
-          "prompt": str,
-          "image_name": str,
-          "image_data": bytes
-        }
-
-    Sync:
-        - duration = end - start (no rescaling, no fallback)
-        - 100% timestamps-based
+    Render video from scenes + audio.
+    Each scene: {"start", "end", "image_bytes"} – completely time-synced with audio.
     """
-    if not scenes:
-        st.error("No scenes to render.")
-        return None
-
-    for sc in scenes:
-        if not sc.get("image_data"):
-            st.error(f"Scene {sc['index']} has no image. Generate images for all scenes first.")
-            return None
-
-    width, height = 854, 480
-    fps = 24
-
-    temp_video = os.path.join(TEMP_DIR, "temp_silent.mp4")
-    final_output = os.path.join(TEMP_DIR, output_name)
-
-    temp_video_abs = os.path.abspath(temp_video)
-    audio_abs = os.path.abspath(audio_path)
-    final_output_abs = os.path.abspath(final_output)
+    width, height = resolution
+    temp_silent = os.path.join(BASE_TEMP_DIR, "temp_silent.mp4")
+    final_path = os.path.join(BASE_TEMP_DIR, "final_video.mp4")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(temp_video_abs, fourcc, fps, (width, height))
+    out = cv2.VideoWriter(temp_silent, fourcc, fps, (width, height))
+
+    # total duration just for logging
+    total_sec = scenes[-1]["end"] - scenes[0]["start"]
+    total_frames_approx = int(total_sec * fps) + 1
+    progress = st.progress(0.0)
+    frame_counter = 0
 
     st.write("🎥 Rendering video frames...")
-    progress_bar = st.progress(0)
-    percent_text = st.empty()
 
-    total_sec = sum(max(sc["end"] - sc["start"], 0.1) for sc in scenes)
-    total_frames_all = max(int(total_sec * fps), 1)
-    current_frame = 0
+    for scene in scenes:
+        duration = scene["end"] - scene["start"]
+        frames = max(1, int(duration * fps))
 
-    for sc in scenes:
-        if st.session_state.stop_requested:
-            st.warning("⛔ Stopped during rendering.")
-            out.release()
-            return None
+        # load image bytes into cv2
+        image_bytes = scene["image_bytes"]
+        img_array = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
-        duration = max(float(sc["end"] - sc["start"]), 0.2)
-        img_bytes = sc["image_data"]
-        if not img_bytes:
-            continue
-
-        file_bytes = np.asarray(bytearray(img_bytes), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, 1)
         if img is None:
-            continue
+            # fallback: black frame
+            img = np.zeros((height, width, 3), dtype=np.uint8)
 
         img = cv2.resize(img, (width, height))
-        frames_in_clip = max(int(duration * fps), 1)
 
-        for i in range(frames_in_clip):
-            if st.session_state.stop_requested:
-                st.warning("⛔ Stopped during rendering.")
-                out.release()
-                return None
-
-            # Zoom in + out wave: min at edges, max at center
-            t = i / max(frames_in_clip - 1, 1)  # 0 → 1
-            centered = 2 * t - 1                 # -1 → 1
-            amp = 1 - abs(centered)             # 0 → 1 → 0
-            scale = 1.0 + zoom_strength * amp
-
+        for i in range(frames):
+            # simple zoom in/out
+            # t from 0..1
+            t = i / max(1, frames - 1)
+            scale = 1.0 + zoom_strength * (t - 0.5)  # small zoom variation
             M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
-            zoomed = cv2.warpAffine(img, M, (width, height))
+            frame = cv2.warpAffine(img, M, (width, height))
 
-            # Apply color mode + grain
-            frame = apply_color_and_grain(
-                zoomed,
-                color_mode=color_mode,
-                film_grain=film_grain,
-                grain_strength=grain_strength,
-            )
+            if color_mode == "Black & white":
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
             out.write(frame)
-            current_frame += 1
-
-            if current_frame % 20 == 0:
-                frac = min(current_frame / float(total_frames_all), 1.0)
-                progress_bar.progress(frac)
-                percent_text.text(f"Rendering: {int(frac * 100)}%")
+            frame_counter += 1
+            if frame_counter % 50 == 0:
+                progress.progress(min(frame_counter / total_frames_approx, 1.0))
 
     out.release()
+    progress.progress(1.0)
 
-    if st.session_state.stop_requested:
-        st.warning("⛔ Stopped before audio merge.")
-        return None
-
-    if not os.path.exists(audio_abs):
-        st.error(f"❌ Audio file not found: {audio_abs}")
-        return None
-    if not os.path.exists(temp_video_abs):
-        st.error(f"❌ Temp video not found: {temp_video_abs}")
-        return None
-
-    st.write("🎵 Merging audio with video...")
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        temp_video_abs,
-        "-i",
-        audio_abs,
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-shortest",
-        final_output_abs,
-    ]
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    # Merge audio with ffmpeg
+    st.write("🎵 Merging audio with video (ffmpeg)...")
+    cmd = (
+        f'ffmpeg -y -i "{temp_silent}" -i "{audio_path}" '
+        f'-c:v libx264 -c:a aac -shortest "{final_path}"'
     )
-
+    # Run ffmpeg
+    import subprocess
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        st.error("❌ Video/audio merge failed.")
-        st.code(result.stdout[-2000:])
-        return None
+        st.error("❌ FFmpeg failed. See logs below.")
+        st.code(result.stderr[:1000])
+        raise RuntimeError("ffmpeg merge failed")
 
-    if not os.path.exists(final_output_abs):
-        st.error("❌ Final video file was not created.")
-        st.code(result.stdout[-2000:])
-        return None
+    return final_path
 
-    if os.path.getsize(final_output_abs) < 1024:
-        st.error("❌ Final video too small / corrupted.")
-        st.code(result.stdout[-2000:])
-        return None
-
-    return final_output_abs
-
-
-def render_preview_scene(
-    scene,
-    output_name="preview_scene.mp4",
-    color_mode="Full color",
-    film_grain=False,
-    grain_strength=10,
-    zoom_strength=0.05,
-):
-    """
-    Sirf ek scene ka chhota preview (mute, no audio).
-    Zoom in/out + B&W + grain yahi effect use karega jo final video me hoga.
-    """
-    width, height = 854, 480
-    fps = 24
-
-    preview_path = os.path.join(TEMP_DIR, output_name)
-    preview_abs = os.path.abspath(preview_path)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(preview_abs, fourcc, fps, (width, height))
-
-    duration = max(float(scene["end"] - scene["start"]), 0.5)
-    img_bytes = scene.get("image_data")
-    if not img_bytes:
-        st.error("This scene has no image to preview.")
-        return None
-
-    file_bytes = np.asarray(bytearray(img_bytes), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, 1)
-    if img is None:
-        st.error("Failed to decode scene image.")
-        return None
-
-    img = cv2.resize(img, (width, height))
-    frames_in_clip = max(int(duration * fps), 1)
-
-    for i in range(frames_in_clip):
-        if st.session_state.stop_requested:
-            st.warning("⛔ Stopped during preview.")
-            out.release()
-            return None
-
-        t = i / max(frames_in_clip - 1, 1)
-        centered = 2 * t - 1
-        amp = 1 - abs(centered)
-        scale = 1.0 + zoom_strength * amp
-
-        M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
-        zoomed = cv2.warpAffine(img, M, (width, height))
-
-        frame = apply_color_and_grain(
-            zoomed,
-            color_mode=color_mode,
-            film_grain=film_grain,
-            grain_strength=grain_strength,
-        )
-        out.write(frame)
-
-    out.release()
-
-    if not os.path.exists(preview_abs):
-        st.error("❌ Preview video was not created.")
-        return None
-
-    return preview_abs
-
-
-# =========================
-# SESSION STATE STRUCTURE
-# =========================
-
-if "scenes" not in st.session_state:
-    st.session_state.scenes = []
-
+# -------------------------------------------------
+# Session state init
+# -------------------------------------------------
 if "audio_path" not in st.session_state:
-    st.session_state.audio_path = None
+    st.session_state["audio_path"] = None
+if "chunks" not in st.session_state:
+    st.session_state["chunks"] = []
+if "scene_prompts" not in st.session_state:
+    st.session_state["scene_prompts"] = []
+if "scene_images" not in st.session_state:
+    st.session_state["scene_images"] = []  # list of dict {index, prompt, image_bytes, source}
+if "video_path" not in st.session_state:
+    st.session_state["video_path"] = None
 
-if "audio_duration" not in st.session_state:
-    st.session_state.audio_duration = None
+# -------------------------------------------------
+# UI – Layout
+# -------------------------------------------------
+st.title("🎬 AI Synced Video Builder (Deepgram + Groq + Image Engine)")
 
-if "transcription_raw" not in st.session_state:
-    st.session_state.transcription_raw = None
-
-if "prompt_raw" not in st.session_state:
-    st.session_state.prompt_raw = None
-
-# =========================
-# SIDEBAR SETTINGS
-# =========================
+st.markdown(
+    "1️⃣ Upload voiceover → 2️⃣ Deepgram se transcript + timestamps → "
+    "3️⃣ Groq se scene prompts → 4️⃣ Image engine se images → 5️⃣ Render video."
+)
 
 with st.sidebar:
-    st.header("Image / Video Settings")
-
-    mode_label = st.selectbox(
-        "Image mode",
-        ["1.5-Fast", "1.0-Slow"],
-        index=0,
-        help="Choose which style/engine mode to use.",
-    )
+    st.header("Render options")
 
     aspect_ratio = st.selectbox(
         "Image aspect ratio",
         ["16:9", "9:16", "1:1"],
         index=0,
-        help="Select the image aspect ratio.",
     )
 
-    visual_style_label = st.selectbox(
-        "Global visual style (applied in prompts)",
+    engine_name = st.selectbox(
+        "Image engine preset",
+        ["1.5-Fast", "1.0-Slow"],
+        index=0,
+        help="Yeh sirf backend provider ko batata hai.",
+    )
+
+    style_choice = st.selectbox(
+        "Visual style (for prompts)",
         [
-            "Neutral / default",
-            "Black & white documentary",
-            "Warm vintage / sepia",
-            "Cold cinematic (blue & orange)",
+            "None / neutral",
+            "Black & white documentary stills",
+            "Vintage film look, slightly grainy",
+            "Cinematic, dramatic lighting",
         ],
-        index=0,
-        help="Choose before generating prompts/images.",
+        index=1,
     )
 
-    # Map style label → style text
-    style_suffix = ""
-    if visual_style_label == "Black & white documentary":
-        style_suffix = "black and white, high contrast, documentary style, subtle film grain"
-    elif visual_style_label == "Warm vintage / sepia":
-        style_suffix = "warm vintage colors, slight sepia tone, soft film look"
-    elif visual_style_label == "Cold cinematic (blue & orange)":
-        style_suffix = "cinematic color grading, teal and orange, dramatic lighting"
+    if style_choice == "None / neutral":
+        global_style = ""
+    elif style_choice == "Black & white documentary stills":
+        global_style = (
+            "High-contrast black and white documentary photography, war-era style."
+        )
+    elif style_choice == "Vintage film look, slightly grainy":
+        global_style = "Vintage film aesthetic, slightly grainy but clear subjects."
+    else:
+        global_style = "Cinematic, dramatic lighting, high detail, 4k still frame."
 
-    color_mode = st.selectbox(
+    color_mode = st.radio(
         "Video color mode",
-        ["Full color", "Black & white"],
-        index=0,
-        help="Applies at render time to all frames.",
-    )
-
-    film_grain = st.checkbox(
-        "Add film grain / noise",
-        value=False,
-        help="Adds subtle noise like vintage / black-noise effect.",
-    )
-
-    grain_strength = st.slider(
-        "Grain strength",
-        0,
-        50,
-        10,
-        help="Higher = stronger noise. Works if film grain is enabled.",
+        ["Color", "Black & white"],
+        index=1,
     )
 
     zoom_strength = st.slider(
-        "Zoom in/out strength",
+        "Zoom effect strength",
         0.0,
-        0.2,
+        0.15,
         0.05,
         step=0.01,
-        help="Controls how strong the zoom animation is.",
     )
 
-    timeout = st.slider("Image request timeout (seconds)", 10, 180, 60)
+    fps = st.slider(
+        "Frames per second (FPS)",
+        18,
+        30,
+        24,
+    )
 
-    st.button("🛑 Stop processing", on_click=request_stop)
+# -------------------------------------------------
+# Step 1 – Audio upload + Deepgram
+# -------------------------------------------------
+st.header("1️⃣ Upload voiceover audio")
 
+audio_file = st.file_uploader("Upload MP3 voiceover", type=["mp3"])
 
-# =========================
-# MAIN UI
-# =========================
+col_a1, col_a2 = st.columns(2)
+with col_a1:
+    analyze_btn = st.button("Analyze with Deepgram", type="primary", disabled=audio_file is None)
 
-st.title("🎬 AI Video Generator")
+if analyze_btn and audio_file:
+    st.session_state["video_path"] = None
+    local_audio_path = save_uploaded_file(
+        audio_file,
+        BASE_TEMP_DIR,
+        "input.mp3",
+    )
+    st.session_state["audio_path"] = local_audio_path
 
-st.markdown(
-    """
-**Flow:**
+    with st.spinner("Sending to Deepgram..."):
+        dg_json = deepgram_transcribe(local_audio_path)
 
-1. Voiceover se transcript + timestamps + scenes (max ~5s per scene)  
-2. Har scene ke liye automatic image prompts (global style apply hota hai)  
-3. Har scene ka prompt edit + image generate / regenerate  
-4. Final review screen: voiceover text + prompt + image (yahin se bhi edit/regenerate)  
-5. Zoom + color + grain ka preview (first scene)  
-6. Jab tum confirm karo, tab final video render (timestamps = 100% sync)  
-"""
+    words = extract_words_from_deepgram(dg_json)
+    chunks = build_chunks_from_words(words, max_chunk_sec=5.0)
+    st.session_state["chunks"] = chunks
+    st.session_state["scene_prompts"] = []
+    st.session_state["scene_images"] = []
+
+    st.success(f"Deepgram result loaded. Found {len(chunks)} scenes / chunks.")
+
+# Show transcript + chunks debug
+if st.session_state["chunks"]:
+    with st.expander("🔍 Transcript chunks (Deepgram)", expanded=False):
+        st.write(f"Total chunks: {len(st.session_state['chunks'])}")
+        for c in st.session_state["chunks"]:
+            st.markdown(
+                f"**Scene {c['index']}** "
+                f"({c['start']:.2f}s → {c['end']:.2f}s) – "
+                f"Duration: {c['end'] - c['start']:.2f}s"
+            )
+            st.write(c["text"])
+
+# -------------------------------------------------
+# Step 2 – Groq prompts
+# -------------------------------------------------
+st.header("2️⃣ Scene prompts from Groq")
+
+if st.session_state["chunks"]:
+    if not st.session_state["scene_prompts"]:
+        if st.button("Generate prompts with AI", type="primary"):
+            with st.spinner("Groq se prompts mangwa rahe hain..."):
+                prompts = groq_scene_prompts(st.session_state["chunks"], global_style)
+            st.session_state["scene_prompts"] = prompts
+            st.success("Scene prompts generated!")
+    else:
+        st.info("Prompts already generated. Aap niche edit kar sakte hain.")
+
+if st.session_state["scene_prompts"]:
+    st.subheader("✏️ Edit scene prompts (before generating images)")
+    edited_prompts = []
+    for c, prompt in zip(st.session_state["chunks"], st.session_state["scene_prompts"]):
+        idx = c["index"]
+        text_key = f"scene_prompt_{idx}"
+        val = st.text_area(
+            f"Scene {idx} ({c['start']:.2f}s–{c['end']:.2f}s)",
+            value=prompt,
+            key=text_key,
+            height=80,
+        )
+        edited_prompts.append(val)
+
+    st.session_state["scene_prompts"] = edited_prompts
+
+# -------------------------------------------------
+# Step 3 – Generate / edit / replace images per scene
+# -------------------------------------------------
+st.header("3️⃣ Generate images per scene")
+
+if st.session_state["scene_prompts"]:
+    col_i1, col_i2 = st.columns(2)
+    with col_i1:
+        gen_images_btn = st.button(
+            "Generate / Regenerate ALL images",
+            help="Har scene ke current prompt se nayi image banayega.",
+        )
+
+    if gen_images_btn:
+        st.session_state["scene_images"] = []  # wipe
+        images = []
+        progress = st.progress(0.0)
+
+        for i, (c, prompt) in enumerate(
+            zip(st.session_state["chunks"], st.session_state["scene_prompts"]), start=1
+        ):
+            status = st.empty()
+            status.write(f"Generating image for Scene {c['index']}...")
+            try:
+                img_bytes = call_image_engine(prompt, aspect_ratio, engine_name)
+                images.append(
+                    {
+                        "index": c["index"],
+                        "prompt": prompt,
+                        "image_bytes": img_bytes,
+                        "source": "api",
+                    }
+                )
+            except Exception as e:
+                st.error(f"Scene {c['index']} image error: {e}")
+                # placeholder black frame
+                blank = np.zeros((480, 854, 3), dtype=np.uint8)
+                _, buf = cv2.imencode(".png", blank)
+                images.append(
+                    {
+                        "index": c["index"],
+                        "prompt": prompt,
+                        "image_bytes": buf.tobytes(),
+                        "source": "error_placeholder",
+                    }
+                )
+            progress.progress(i / len(st.session_state["scene_prompts"]))
+            status.empty()
+
+        st.session_state["scene_images"] = images
+        st.success("All scene images generated / updated.")
+
+# Per-scene controls: preview, prompt edit, regenerate, manual upload
+if st.session_state["scene_images"]:
+    st.subheader("🖼 Scene images – edit, regenerate, or replace manually")
+
+    imgs = st.session_state["scene_images"]
+    new_imgs = []
+
+    for i, scene in enumerate(imgs):
+        idx = scene["index"]
+        c = st.session_state["chunks"][idx - 1]
+        col1, col2 = st.columns([2, 1])
+
+        with col1:
+            st.markdown(
+                f"**Scene {idx}** ({c['start']:.2f}s–{c['end']:.2f}s)"
+                f" – Duration: {c['end'] - c['start']:.2f}s"
+            )
+            st.image(scene["image_bytes"], caption=f"Scene {idx}", width="stretch")
+
+        with col2:
+            # prompt is already in session_state["scene_prompts"]
+            prompt_key = f"scene_prompt_{idx}"
+            current_prompt = st.session_state["scene_prompts"][idx - 1]
+
+            st.markdown("Current prompt:")
+            st.text_area(
+                f"Prompt S{idx}",
+                value=current_prompt,
+                key=prompt_key,
+                height=100,
+            )
+
+            regen_btn = st.button(f"Regenerate S{idx}", key=f"regen_{idx}")
+            upload_file = st.file_uploader(
+                f"Replace S{idx} image",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=f"upload_{idx}",
+            )
+
+            updated_scene = dict(scene)
+
+            # Handle manual upload (wins over regen if both triggered this run)
+            if upload_file is not None:
+                updated_scene["image_bytes"] = upload_file.read()
+                updated_scene["source"] = "upload"
+
+            # Handle regenerate
+            if regen_btn and upload_file is None:
+                try:
+                    new_prompt = st.session_state[prompt_key]
+                except KeyError:
+                    new_prompt = current_prompt
+                st.session_state["scene_prompts"][idx - 1] = new_prompt
+                try:
+                    img_bytes = call_image_engine(new_prompt, aspect_ratio, engine_name)
+                    updated_scene["image_bytes"] = img_bytes
+                    updated_scene["prompt"] = new_prompt
+                    updated_scene["source"] = "api_regen"
+                    st.success(f"Scene {idx} image regenerated.")
+                except Exception as e:
+                    st.error(f"Regenerate S{idx} failed: {e}")
+
+            new_imgs.append(updated_scene)
+
+        st.markdown("---")
+
+    # save back
+    st.session_state["scene_images"] = new_imgs
+
+# -------------------------------------------------
+# Step 4 – Final confirmation + render video
+# -------------------------------------------------
+st.header("4️⃣ Final review & render")
+
+ready = (
+    st.session_state["audio_path"]
+    and st.session_state["chunks"]
+    and st.session_state["scene_prompts"]
+    and st.session_state["scene_images"]
 )
 
-audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
-
-st.divider()
-
-col_btn1, col_btn2 = st.columns(2)
-with col_btn1:
-    analyze = st.button("1️⃣ Analyze Voiceover & Create Scenes", type="primary")
-with col_btn2:
-    reset = st.button("♻️ Reset / Clear")
-
-if reset:
-    st.session_state.scenes = []
-    st.session_state.audio_path = None
-    st.session_state.audio_duration = None
-    st.session_state.transcription_raw = None
-    st.session_state.prompt_raw = None
-    st.session_state.stop_requested = False
-    st.success("State cleared.")
-    st.stop()
-
-# =========================
-# STEP 1: ANALYZE (TRANSCRIPT + PROMPTS)
-# =========================
-
-if analyze:
-    st.session_state.stop_requested = False
-
-    if not audio_file:
-        st.error("Please upload an MP3 voiceover first.")
-        st.stop()
-
-    status = st.status("Starting analysis...", expanded=True)
-
-    # Clean temp
-    status.write("🧹 Cleaning temp folder...")
-    clean_temp_dir()
-
-    # Save audio
-    status.write("💾 Saving audio file...")
-    local_audio = os.path.join(TEMP_DIR, "input.mp3")
-    local_audio = os.path.abspath(local_audio)
-    with open(local_audio, "wb") as f:
-        f.write(audio_file.getbuffer())
-
-    if not os.path.exists(local_audio):
-        st.error("❌ Failed to save audio file.")
-        st.stop()
-
-    audio_duration = get_audio_duration(local_audio)
-    st.session_state.audio_path = local_audio
-    st.session_state.audio_duration = audio_duration
-
-    if audio_duration:
-        status.write(f"⏱️ Audio duration: ~{audio_duration:.2f} seconds")
-
-    if st.session_state.stop_requested:
-        st.warning("⛔ Stopped by user.")
-        st.stop()
-
-    # Transcription
-    status.write("👂 Getting transcript + timestamps...")
-    full_text, chunks, raw = get_transcript_chunks(
-        local_audio,
-        audio_duration=audio_duration,
-        max_chunk_duration=5.0,
-        max_words_per_chunk=25,
+if not ready:
+    st.warning(
+        "Voiceover, chunks, prompts, aur images sab complete honi chahiye "
+        "pehle. Upar ke steps complete karo."
     )
-    st.session_state.transcription_raw = raw
-
-    if not chunks:
-        st.error("❌ No scenes found from voiceover.")
-        st.stop()
-
-    if st.session_state.stop_requested:
-        st.warning("⛔ Stopped by user.")
-        st.stop()
-
-    # Text model: prompts (with global style)
-    status.write("🧠 Generating image prompts for each scene...")
-    prompts_map, prompt_raw = generate_image_prompts_for_chunks(
-        chunks,
-        global_style_text=style_suffix,
-    )
-    st.session_state.prompt_raw = prompt_raw
-
-    if not prompts_map:
-        status.update(label="❌ Prompt generation failed.", state="error", expanded=True)
-        st.stop()
-
-    # Build scenes
-    scenes = []
-    for c in chunks:
-        idx = c["index"]
-        scenes.append(
-            {
-                "index": idx,
-                "start": float(c["start"]),
-                "end": float(c["end"]),
-                "text": c["text"],
-                "prompt": prompts_map.get(idx, ""),
-                "image_name": None,
-                "image_data": None,
-            }
-        )
-
-    st.session_state.scenes = scenes
-    status.update(label="✅ Scenes created!", state="complete", expanded=False)
-    st.success("Scenes created. Scroll down to edit prompts and generate images.")
-
-
-# =========================
-# SCENE EDITOR (PROMPT + IMAGE)
-# =========================
-
-scenes = st.session_state.scenes
-audio_path = st.session_state.audio_path
-
-if scenes:
-    st.subheader("2️⃣ Scene Prompts & Images (Editing)")
-
-    st.caption(
-        "Har scene voiceover se linked hai. Prompt edit karo, phir image generate / regenerate karo."
-    )
-
-    # Bulk generate for scenes without image
-    if st.button("🖼️ Generate images for ALL scenes without image"):
-        for sc in scenes:
-            if st.session_state.stop_requested:
-                st.warning("⛔ Stopped by user.")
-                break
-            if sc["image_data"]:
-                continue
-            try:
-                with st.spinner(f"Generating image for scene {sc['index']}..."):
-                    fname, data, _ = generate_image_from_prompt(
-                        sc["prompt"],
-                        aspect_ratio,
-                        mode_label,
-                        IMAGE_API_KEY,
-                        timeout=timeout,
-                    )
-                    sc["image_name"] = fname
-                    sc["image_data"] = data
-            except Exception as e:
-                st.error(f"Scene {sc['index']} image error: {e}")
-        st.session_state.scenes = scenes
-        st.rerun()
-
-    st.divider()
-
-    # Per-scene editing UI
-    for sc in scenes:
-        idx = sc["index"]
-        start = sc["start"]
-        end = sc["end"]
-        text = sc["text"]
-
-        with st.container():
-            st.markdown(f"### 🎬 Scene {idx}")
-            st.caption(f"Time: {start:.2f}s → {end:.2f}s  |  Duration: {end - start:.2f}s")
-
-            st.text_area(
-                "Voiceover text (read-only)",
-                value=text,
-                key=f"scene_text_{idx}",
-                height=80,
-                disabled=True,
+else:
+    # Debug: show summary
+    with st.expander("📋 Final scene summary", expanded=False):
+        for c, prompt, img in zip(
+            st.session_state["chunks"],
+            st.session_state["scene_prompts"],
+            st.session_state["scene_images"],
+        ):
+            st.markdown(
+                f"**Scene {c['index']}** ({c['start']:.2f}s–{c['end']:.2f}s) –"
+                f" duration {(c['end'] - c['start']):.2f}s – source: {img['source']}"
             )
+            st.write(prompt)
 
-            # Editable prompt (this will be used for image generation)
-            prompt_key = f"scene_prompt_{idx}"
-            if prompt_key not in st.session_state:
-                st.session_state[prompt_key] = sc["prompt"]
-
-            new_prompt = st.text_area(
-                "Image prompt",
-                key=prompt_key,
-                height=80,
-            )
-            sc["prompt"] = new_prompt
-
-            col_a, col_b = st.columns([1, 2])
-
-            with col_a:
-                gen_label = "Generate image" if not sc["image_data"] else "Regenerate image"
-                if st.button(gen_label, key=f"gen_btn_{idx}"):
-                    try:
-                        with st.spinner(f"Generating image for scene {idx}..."):
-                            fname, data, _ = generate_image_from_prompt(
-                                sc["prompt"],
-                                aspect_ratio,
-                                mode_label,
-                                IMAGE_API_KEY,
-                                timeout=timeout,
-                            )
-                            sc["image_name"] = fname
-                            sc["image_data"] = data
-                            st.session_state.scenes = scenes
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Image error (scene {idx}): {e}")
-
-            with col_b:
-                if sc["image_data"]:
-                    st.image(
-                        sc["image_data"],
-                        caption=f"{sc['image_name'] or 'Scene image'}",
-                        use_container_width=True,
-                    )
-                else:
-                    st.info("No image generated yet for this scene.")
-
-            st.markdown("---")
-
-    st.divider()
-
-    # =========================
-    # FINAL REVIEW (VOICEOVER + PROMPT + IMAGE) + PREVIEW
-    # =========================
-
-    st.subheader("3️⃣ Final Review (Text + Prompts + Images)")
-
-    st.caption(
-        "Yahan se tum last time sab check kar sakte ho. Isi screen se prompt change + image regenerate bhi kar sakte ho. "
-        "Jab sab scenes sahi lagte hain, tab neeche se video render karo."
+    confirm = st.checkbox(
+        "I have reviewed prompts & images. Render final video.",
+        value=False,
     )
 
-    # Preview first scene with current zoom/color/grain
-    preview_btn = st.button("👁️ Preview first scene (no audio)")
-    if preview_btn:
-        first_scene = scenes[0]
-        if not first_scene.get("image_data"):
-            st.error("First scene has no image yet. Generate it before preview.")
-        else:
-            with st.spinner("Rendering preview for first scene..."):
-                preview_path = render_preview_scene(
-                    first_scene,
-                    output_name="preview_scene.mp4",
-                    color_mode=color_mode,
-                    film_grain=film_grain,
-                    grain_strength=grain_strength,
-                    zoom_strength=zoom_strength,
-                )
-            if preview_path:
-                with open(preview_path, "rb") as f:
-                    preview_bytes = f.read()
-                st.video(preview_bytes)
+    render_btn = st.button(
+        "🎬 Render video now",
+        type="primary",
+        disabled=not confirm,
+    )
 
-    missing = [sc["index"] for sc in scenes if not sc["image_data"]]
-    if missing:
-        st.warning(
-            f"These scenes have no image yet: {missing}. "
-            "Har scene k liye image generate karo before rendering."
-        )
-
-    # Compact review with edit/regenerate again
-    for sc in scenes:
-        idx = sc["index"]
-        start = sc["start"]
-        end = sc["end"]
-
-        with st.expander(f"Scene {idx} – {start:.2f}s → {end:.2f}s", expanded=False):
-            st.write("**Voiceover text:**")
-            st.write(sc["text"])
-
-            prompt_key = f"scene_prompt_{idx}"
-
-            new_prompt_final = st.text_area(
-                "Final prompt (you can still edit)",
-                key=prompt_key + "_final",
-                value=sc["prompt"],
-                height=80,
-            )
-
-            # final prompt bhi scene obj me update
-            sc["prompt"] = new_prompt_final
-
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                gen_label = "Generate image" if not sc["image_data"] else "Regenerate image"
-                if st.button(gen_label, key=f"final_gen_btn_{idx}"):
-                    try:
-                        with st.spinner(f"Generating image for scene {idx} (final review)..."):
-                            fname, data, _ = generate_image_from_prompt(
-                                sc["prompt"],
-                                aspect_ratio,
-                                mode_label,
-                                IMAGE_API_KEY,
-                                timeout=timeout,
-                            )
-                            sc["image_name"] = fname
-                            sc["image_data"] = data
-                            st.session_state.scenes = scenes
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Image error (scene {idx}): {e}")
-
-            with col2:
-                if sc["image_data"]:
-                    st.image(
-                        sc["image_data"],
-                        caption=f"{sc['image_name'] or 'Scene image'}",
-                        use_container_width=True,
-                    )
-                else:
-                    st.info("No image generated yet for this scene.")
-
-    st.divider()
-
-    # Final render button
-    if st.button("✅ Finalize & Render Video", type="primary"):
-        if not audio_path or not os.path.exists(audio_path):
-            st.error("Audio file not found. Please re-analyze the voiceover.")
-        elif missing:
-            st.error("Some scenes have no image. Generate all images first.")
-        else:
-            st.session_state.stop_requested = False
-            with st.spinner("Rendering video..."):
-                final_vid_path = render_video_from_scenes(
-                    st.session_state.scenes,
-                    audio_path,
-                    color_mode=color_mode,
-                    film_grain=film_grain,
-                    grain_strength=grain_strength,
-                    zoom_strength=zoom_strength,
-                )
-
-            if final_vid_path is None:
-                st.warning("⛔ Video generation failed or stopped.")
-            else:
-                st.success("🎉 Video rendered successfully!")
-                with open(final_vid_path, "rb") as f:
-                    video_bytes = f.read()
-
-                st.video(video_bytes)
-                st.download_button(
-                    "⬇️ Download video",
-                    data=video_bytes,
-                    file_name="AI_Video.mp4",
-                    mime="video/mp4",
-                )
-
-# =========================
-# DEBUG EXPANDERS
-# =========================
-
-if st.session_state.transcription_raw:
-    with st.expander("🧩 Transcription Output (raw JSON + scenes)", expanded=False):
-        st.subheader("Raw transcription JSON")
-        st.json(st.session_state.transcription_raw)
-        st.subheader("Scenes (index, start, end, text)")
-        st.json(
-            [
+    if render_btn and confirm:
+        # Build scenes array with image bytes + timings
+        scenes_for_render = []
+        for c, img in zip(
+            st.session_state["chunks"],
+            st.session_state["scene_images"],
+        ):
+            scenes_for_render.append(
                 {
-                    "index": sc["index"],
-                    "start": sc["start"],
-                    "end": sc["end"],
-                    "text": sc["text"],
+                    "index": c["index"],
+                    "start": c["start"],
+                    "end": c["end"],
+                    "image_bytes": img["image_bytes"],
                 }
-                for sc in st.session_state.scenes
-            ]
-        )
+            )
 
-if st.session_state.prompt_raw:
-    with st.expander("🧠 Image prompts (raw model output)", expanded=False):
-        st.text(st.session_state.prompt_raw)
+        try:
+            final_path = render_video(
+                scenes_for_render,
+                st.session_state["audio_path"],
+                color_mode=color_mode,
+                zoom_strength=zoom_strength,
+                fps=fps,
+            )
+            st.session_state["video_path"] = final_path
+            st.success("✅ Video render complete!")
+        except Exception as e:
+            st.error(f"Video render failed: {e}")
+
+# Show final video if exists
+if st.session_state["video_path"] and os.path.exists(st.session_state["video_path"]):
+    st.subheader("🎞 Final video")
+    st.video(st.session_state["video_path"], format="video/mp4")
+    with open(st.session_state["video_path"], "rb") as f:
+        st.download_button(
+            "Download MP4",
+            data=f.read(),
+            file_name="ai_video.mp4",
+            mime="video/mp4",
+        )
