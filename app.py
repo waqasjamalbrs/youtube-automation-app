@@ -1,24 +1,28 @@
+import os
+import re
+import json
+import time
+import shutil
+import base64
+import tempfile
+import subprocess
+from io import BytesIO
+from typing import List, Tuple
+from urllib.parse import urljoin
+
+import requests
 import streamlit as st
 import cv2
 import numpy as np
 from groq import Groq
 from PIL import Image
-import json
-import subprocess
-import os
-import shutil
-import requests
-import base64
-from io import BytesIO
-import tempfile
-import re
 
 # =========================
 # PAGE CONFIG
 # =========================
 
 st.set_page_config(
-    page_title="AI Video Generator (Deepgram + Groq)",
+    page_title="AI Video Generator",
     page_icon="🎬",
     layout="wide",
 )
@@ -36,24 +40,35 @@ def request_stop():
 
 
 # =========================
-# SECRETS
+# SECRETS / KEYS
 # =========================
 
+# Transcription API key
 try:
     DEEPGRAM_KEY = st.secrets["DEEPGRAM_API_KEY"]
 except Exception:
     st.error("🚨 Please add DEEPGRAM_API_KEY in Streamlit secrets.")
     st.stop()
 
-GROQ_KEY = st.secrets.get("GROQ_API_KEY", None)
+# Text model API key
+GROQ_KEY = st.secrets.get("GROQ_API_KEY")
 if not GROQ_KEY:
-    st.error("🚨 Please add GROQ_API_KEY in Streamlit secrets as GROQ_API_KEY.")
+    st.error("🚨 Please add GROQ_API_KEY in Streamlit secrets.")
     st.stop()
 
 groq_client = Groq(api_key=GROQ_KEY)
 
+# Image API key
+IMAGE_API_KEY = st.secrets.get("YOUSMIND_API_KEY")
+if not IMAGE_API_KEY:
+    st.error("🚨 Please add image API key in Streamlit secrets as YOUSMIND_API_KEY.")
+    st.stop()
+
+# Internal image API URL (hidden from UI)
+IMAGE_API_URL = "https://yousmind.com/api/image-generator/generate"
+
 # =========================
-# TEMP DIR (/tmp – safe)
+# TEMP DIR
 # =========================
 
 BASE_TEMP_DIR = os.path.join(tempfile.gettempdir(), "ai_video_app")
@@ -81,6 +96,16 @@ def clean_temp_dir():
 # UTILS
 # =========================
 
+FILENAME_SAFE = re.compile(r"[^a-zA-Z0-9_\-]+")
+
+
+def safe_name(s: str, max_len: int = 60) -> str:
+    """Convert a prompt into a safe file name."""
+    s = s.strip().replace(" ", "_")
+    s = FILENAME_SAFE.sub("", s)
+    return (s[:max_len] or "prompt").strip("_")
+
+
 def get_audio_duration(audio_path: str):
     """ffprobe se audio ki duration (seconds) nikal lo."""
     try:
@@ -105,8 +130,35 @@ def get_audio_duration(audio_path: str):
         return None
 
 
+def download_image(url: str, timeout: int = 60) -> Tuple[str, bytes]:
+    """
+    Download an image from a URL.
+    """
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+
+    ext = "png"
+    lower = url.lower()
+    if ".jpg" in lower or ".jpeg" in lower:
+        ext = "jpg"
+    elif ".gif" in lower:
+        ext = "gif"
+    elif ".webp" in lower:
+        ext = "webp"
+    else:
+        ct = (r.headers.get("content-type") or "").lower()
+        if "jpeg" in ct or "jpg" in ct:
+            ext = "jpg"
+        elif "gif" in ct:
+            ext = "gif"
+        elif "webp" in ct:
+            ext = "webp"
+
+    return ext, r.content
+
+
 # =========================
-# DEEPGRAM: TRANSCRIPT + TIMESTAMPS + SMART CHUNKS
+# TRANSCRIPTION: TRANSCRIPT + CHUNKS
 # =========================
 
 def get_transcript_chunks(
@@ -117,7 +169,7 @@ def get_transcript_chunks(
     max_chunk_duration=12.0,
 ):
     """
-    Deepgram:
+    Transcription API:
     - full transcript
     - word timestamps
     - words ko chunks (segments) me todta hai:
@@ -131,7 +183,7 @@ def get_transcript_chunks(
           {"index": 1, "text": "...", "start": 0.5, "end": 7.8},
           ...
         ],
-        deepgram_raw (dict)
+        raw (dict)
     """
     url = "https://api.deepgram.com/v1/listen"
 
@@ -156,13 +208,13 @@ def get_transcript_chunks(
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        st.error(f"❌ Deepgram request failed: {e}")
+        st.error(f"❌ Transcription request failed: {e}")
         return "", [], None
 
     try:
         alt = data["results"]["channels"][0]["alternatives"][0]
     except Exception as e:
-        st.error(f"❌ Unexpected Deepgram response format: {e}")
+        st.error(f"❌ Unexpected transcription response format: {e}")
         st.write(data)
         return "", [], data
 
@@ -225,6 +277,7 @@ def get_transcript_chunks(
         )
 
     if audio_duration and chunks:
+        # last chunk ko audio ke end ke sath align rakhna
         if chunks[-1]["end"] > audio_duration + 0.3:
             chunks[-1]["end"] = float(audio_duration)
         elif chunks[-1]["end"] < audio_duration - 0.5:
@@ -234,326 +287,197 @@ def get_transcript_chunks(
 
 
 # =========================
-# GROQ VISION: PER-IMAGE DESCRIPTION
+# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT)
 # =========================
 
-def describe_all_images_with_groq(image_files, max_images=50):
+def generate_image_prompts_for_chunks(chunks):
     """
-    Groq Vision se images ki detailed descriptions nikalta hai.
-    - Har image ke liye ALAG request (zyada accurate)
-    - Prompt: "What is in this image and what is happening?" (English)
-    Returns:
-        desc_map: {filename: description}
-        raw_responses: list of raw JSON responses (debug ke liye)
+    Har chunk ke liye ek image-generation prompt.
+    Model se output **plain text** me lenge, JSON nahi.
+    Format jo hum expect kar rahe hain:
+
+      Scene 1: cinematic prompt...
+      Scene 2: another prompt...
+      Scene 3: ...
+
+    Return:
+        prompts_map: {chunk_index: prompt_str}
+        raw_text: str (model ka raw response)
     """
-    if not image_files:
-        return {}, []
-
-    image_files = image_files[:max_images]
-    model_id = "meta-llama/llama-4-scout-17b-16e-instruct"
-
-    desc_map = {}
-    raw_responses = []
-
-    total = len(image_files)
-    progress = st.progress(0)
-    status = st.empty()
-
-    for i, uf in enumerate(image_files, start=1):
-        if st.session_state.stop_requested:
-            st.warning("⛔ Stopped by user during image description.")
-            break
-
-        status.text(f"👁️ Describing image {i} of {total}: {uf.name}")
-
-        # image → resized JPEG → data URL
-        uf.seek(0)
-        img = Image.open(uf).convert("RGB")
-        max_side = 1280
-        w, h = img.size
-        if max(w, h) > max_side:
-            scale = max_side / float(max(w, h))
-            img = img.resize((int(w * scale), int(h * scale)))
-
-        buf = BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        data_url = f"data:image/jpeg;base64,{b64}"
-
-        content = [
-            {
-                "type": "text",
-                "text": (
-                    "You are describing ONE image.\n\n"
-                    "QUESTION:\n"
-                    "- What is in this image?\n"
-                    "- What is happening in this image?\n"
-                    "- Answer in clear, simple English.\n\n"
-                    "Return ONLY JSON in this exact format:\n"
-                    "{\n"
-                    f'  \"filename\": \"{uf.name}\",\n'
-                    '  \"description\": "one or two sentences describing what is in the image and what is happening"\n'
-                    "}\n"
-                    "- Do NOT mention indexes.\n"
-                    "- Do NOT talk about other images.\n"
-                    "- Focus ONLY on this single image."
-                ),
-            },
-            {
-                "type": "image_url",
-                "image_url": {"url": data_url},
-            },
-        ]
-
-        try:
-            resp = groq_client.chat.completions.create(
-                model=model_id,
-                messages=[{"role": "user", "content": content}],
-                response_format={"type": "json_object"},
-                max_completion_tokens=256,
-                temperature=0.2,
-            )
-            text = resp.choices[0].message.content or "{}"
-            data = json.loads(text)
-            raw_responses.append(data)
-
-            desc = data.get("description") or ""
-            desc = desc.strip()
-            if not desc:
-                desc = "No clear description."
-
-            # apne actual filename ko source of truth rakhte hain
-            desc_map[uf.name] = desc
-        except Exception as e:
-            st.warning(f"⚠️ Groq Vision failed for {uf.name}: {e}")
-            desc_map[uf.name] = "Description failed."
-
-        progress.progress(i / total)
-
-    return desc_map, raw_responses
-
-
-# =========================
-# GROQ TEXT: SEMANTIC MAPPING (VOICEOVER + DESCRIPTIONS)
-# =========================
-
-def map_chunks_to_images_using_descriptions(chunks, image_desc_map):
-    """
-    Groq TEXT se semantic mapping:
-    - CHUNKS (Deepgram se): [{index, text, start, end}]
-    - IMAGE_DESC_MAP: {filename: description}
-
-    Groq ko:
-      - chunks (brief)
-      - saari images (filename + description)
-    bhejte hain, aur yeh maangte hain:
-      {
-        "mappings": [
-          { "chunk_index": 1, "image": "some_file.png" },
-          ...
-        ]
-      }
-
-    Rules:
-      - Har chunk_index EXACTLY once aana chahiye
-      - Image name IMAGES list se hi copy hona chahiye
-      - Sequence pe rely nahi karna, sirf meaning pe
-    """
-    if not chunks or not image_desc_map:
-        return [], None
+    if not chunks:
+        return {}, None
 
     model_id = "llama-3.1-8b-instant"
 
-    # short chunks for context
     chunks_brief = []
     for c in chunks:
         text = c.get("text", "")
-        if len(text) > 350:
-            text = text[:350] + "..."
-        chunks_brief.append({"index": c["index"], "text": text})
-
-    images_list = [
-        {"filename": fn, "description": desc}
-        for fn, desc in image_desc_map.items()
-    ]
-
-    num_chunks = len(chunks_brief)
-    num_images = len(images_list)
-    min_distinct = min(4, num_images)
+        if len(text) > 400:
+            text = text[:400] + "..."
+        chunks_brief.append(
+            {
+                "index": c["index"],
+                "start": round(float(c["start"]), 2),
+                "end": round(float(c["end"]), 2),
+                "text": text,
+            }
+        )
 
     prompt = f"""
-You are aligning narration chunks with images.
+You are an AI storyboard artist for a video.
 
-CHUNKS (from a voiceover, already time-aligned separately):
+You receive a list of narration CHUNKS from a voiceover, each with:
+- index
+- start time (seconds)
+- end time (seconds)
+- text (the spoken line in that part of the story)
+
+Your job is to create ONE image-generation prompt PER chunk.
+
+Goals:
+- Each prompt should visually represent the meaning of that chunk.
+- Imagine this is for a cinematic video.
+- Use clear, specific English.
+- You can mention camera / composition / lighting when helpful
+  (e.g. "wide shot", "close-up", "cinematic lighting", "dramatic shadows").
+- Do NOT mention the word "chunk", "voiceover", "caption", or any subtitles.
+- Do NOT add anything about on-screen text or UI.
+
+CHUNKS:
 {json.dumps(chunks_brief, ensure_ascii=False, indent=2)}
 
-IMAGES (each with filename and description):
-{json.dumps(images_list, ensure_ascii=False, indent=2)}
+RESPONSE FORMAT (TEXT ONLY, NO JSON):
+- For EACH chunk, write exactly ONE line in this format:
+  Scene <index>: <image prompt>
 
-TASK:
-For EACH chunk in CHUNKS, choose EXACTLY ONE image filename from IMAGES
-that best matches the MEANING of that chunk's text.
-Use semantic similarity between the chunk text and the image description.
+Examples of lines:
+  Scene 1: wide shot of a busy city at night, cinematic lighting, blue and orange colors
+  Scene 2: close-up of a worried mother holding her child in a small apartment
 
-VERY IMPORTANT RULES:
-- You MUST create exactly {num_chunks} mapping objects.
-- Each "chunk_index" must appear EXACTLY ONCE in the mappings.
-- "image" must be EXACTLY one of the filenames from IMAGES (copy-paste).
-- Do NOT assign based on list order or index (no 1->1, 2->2 just by position).
-- REUSE of images is allowed, but ONLY if the meaning clearly matches.
-- Try to use AT LEAST {min_distinct} different images overall (if logically possible).
-- Do NOT assign all chunks to the same image.
-
-RETURN FORMAT (JSON ONLY):
-{{
-  "mappings": [
-    {{ "chunk_index": 1, "image": "FILENAME_FROM_IMAGES_LIST" }},
-    {{ "chunk_index": 2, "image": "FILENAME_FROM_IMAGES_LIST" }}
-  ]
-}}
+Rules:
+- Use the exact word "Scene" (capital S), then a space, then the chunk index,
+  then a colon, then a space, then the prompt.
+- EXACTLY one line per chunk index.
+- Do not add any extra commentary before or after the list.
+- Do not use JSON.
 """
 
     try:
         resp = groq_client.chat.completions.create(
             model=model_id,
             messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            max_completion_tokens=2048,
-            temperature=0.2,
+            max_completion_tokens=4096,
+            temperature=0.4,
         )
-        text = resp.choices[0].message.content or "{}"
-        data = json.loads(text)
+        text = resp.choices[0].message.content or ""
     except Exception as e:
-        st.warning(f"⚠️ Groq text mapping failed: {e}")
-        return [], None
+        st.error(f"❌ Failed to generate image prompts: {e}")
+        return {}, None
 
-    mappings = data.get("mappings")
-    if not isinstance(mappings, list):
-        return [], data
+    raw_text = text
 
-    valid_files = set(image_desc_map.keys())
-    valid_chunk_indexes = {c["index"] for c in chunks}
+    # Parse lines: Scene <index>: <prompt>
+    prompts_map = {}
+    for line in raw_text.splitlines():
+        m = re.match(r"\s*Scene\s+(\d+)\s*:\s*(.+)", line, re.IGNORECASE)
+        if m:
+            idx = int(m.group(1))
+            pmt = m.group(2).strip()
+            if pmt:
+                prompts_map[idx] = pmt
 
-    cleaned = []
-    seen_chunks = set()
+    # Strictness: har chunk k liye prompt required (no silent fallback)
+    expected_indexes = {c["index"] for c in chunks}
+    missing = sorted(list(expected_indexes - set(prompts_map.keys())))
+    if missing:
+        st.error(
+            f"❌ Some scene prompts are missing from the AI response. "
+            f"Missing scene indexes: {missing}\n\n"
+            "Open the 'Image prompts' debug expander, check the model output, "
+            "and try again."
+        )
+        return {}, raw_text
 
-    for m in mappings:
-        if not isinstance(m, dict):
-            continue
-        idx = m.get("chunk_index")
-        img = m.get("image")
-        if (
-            isinstance(idx, int)
-            and idx in valid_chunk_indexes
-            and img in valid_files
-            and idx not in seen_chunks
-        ):
-            cleaned.append({"chunk_index": idx, "image": img})
-            seen_chunks.add(idx)
+    return prompts_map, raw_text
 
-    if len(cleaned) < len(chunks):
-        st.warning(
-            f"⚠️ Groq mapping only returned {len(cleaned)} of {len(chunks)} chunks. "
-            "Missing chunks will use fallback later."
+
+# =========================
+# IMAGE API: SINGLE IMAGE PER PROMPT
+# =========================
+
+def generate_image_from_prompt(prompt, aspect_ratio, mode_label, api_key, timeout=60):
+    """
+    Image API wrapper:
+    - Prompt is ALWAYS plain text string.
+    - Returns: (filename, image_bytes, raw_response_dict)
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": api_key,
+    }
+    payload = {
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+        # "provider" field sirf mode_label ki value use karega
+        "provider": mode_label,
+        "n": 1,
+    }
+
+    r = requests.post(IMAGE_API_URL, headers=headers, json=payload, timeout=timeout)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw_text": r.text}
+
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"HTTP {r.status_code} | Response: {str(data)[:400]}"
         )
 
-    return cleaned, data
+    urls = data.get("image_urls", [])
+    if not urls:
+        raise RuntimeError(
+            f"No image_urls in response: {str(data)[:400]}"
+        )
+
+    url = urls[0]
+    if not url.lower().startswith("http"):
+        url = urljoin(IMAGE_API_URL, url)
+
+    ext, raw = download_image(url, timeout=timeout)
+    filename = f"{safe_name(prompt)}.{ext}"
+    return filename, raw, data
 
 
 # =========================
-# TIMELINE BUILD
+# VIDEO RENDERING FROM SCENES (100% SYNC)
 # =========================
 
-def build_timeline_sequential(chunks, image_names, audio_duration=None, min_dur=0.5):
-    """Simple deterministic fallback: chunk 1 → img 1, chunk 2 → img 2, etc."""
-    if not chunks or not image_names:
-        return []
-
-    timeline = []
-    n_images = len(image_names)
-
-    for ch in chunks:
-        dur = max(ch["end"] - ch["start"], min_dur)
-        idx = ch["index"]
-        img = image_names[(idx - 1) % n_images]
-        timeline.append({"image": img, "duration_seconds": float(dur)})
-
-    if audio_duration and audio_duration > 5:
-        total_planned = sum(max(t["duration_seconds"], 0.1) for t in timeline)
-        if total_planned > 0:
-            scale = audio_duration / total_planned
-            for t in timeline:
-                t["duration_seconds"] = max(t["duration_seconds"] * scale, min_dur)
-
-    return timeline
-
-
-def build_timeline_with_mapping(chunks, mappings, image_names,
-                                audio_duration=None, min_dur=0.5):
+def render_video_from_scenes(scenes, audio_path, output_name="final_video.mp4"):
     """
-    Mapping-based:
-    - Agar mapping bekaar ho (sirf 1 image / 1 chunk / bohot kam coverage)
-      → sequential fallback
+    Scenes: list of dicts:
+        {
+          "index": int,
+          "start": float,
+          "end": float,
+          "text": str,
+          "prompt": str,
+          "image_name": str,
+          "image_data": bytes
+        }
+
+    Sync:
+        - duration = end - start (no rescaling, no fallback)
+        - 100% timestamps-based
     """
-    if not chunks or not image_names:
-        return []
-
-    if not mappings:
-        return build_timeline_sequential(chunks, image_names, audio_duration, min_dur)
-
-    idx_to_img = {}
-    for m in mappings:
-        idx = m.get("chunk_index")
-        img = m.get("image")
-        if isinstance(idx, int) and img in image_names:
-            idx_to_img[idx] = img
-
-    used_images = set(idx_to_img.values())
-    used_chunks = set(idx_to_img.keys())
-    coverage_ratio = len(used_chunks) / max(len(chunks), 1)
-
-    if (
-        len(used_images) <= 1
-        or len(used_chunks) <= 1
-        or coverage_ratio < 0.5
-    ):
-        st.warning("⚠️ Groq mapping looked degenerate, using sequential mapping instead.")
-        return build_timeline_sequential(chunks, image_names, audio_duration, min_dur)
-
-    timeline = []
-    n_images = len(image_names)
-
-    for ch in chunks:
-        dur = max(ch["end"] - ch["start"], min_dur)
-        idx = ch["index"]
-        img = idx_to_img.get(idx)
-        if not img:
-            img = image_names[(idx - 1) % n_images]
-        timeline.append({"image": img, "duration_seconds": float(dur)})
-
-    if audio_duration and audio_duration > 5:
-        total_planned = sum(max(t["duration_seconds"], 0.1) for t in timeline)
-        if total_planned > 0:
-            scale = audio_duration / total_planned
-            for t in timeline:
-                t["duration_seconds"] = max(t["duration_seconds"] * scale, min_dur)
-
-    return timeline
-
-
-# =========================
-# VIDEO RENDERING
-# =========================
-
-def render_video(timeline, audio_path, image_map, output_name="final_video.mp4"):
-    """
-    OpenCV + FFmpeg:
-    - frames from images
-    - merge with audio
-    """
-    if not timeline:
-        st.error("No timeline provided.")
+    if not scenes:
+        st.error("No scenes to render.")
         return None
+
+    for sc in scenes:
+        if not sc.get("image_data"):
+            st.error(f"Scene {sc['index']} has no image. Generate images for all scenes first.")
+            return None
 
     width, height = 854, 480
     fps = 24
@@ -572,24 +496,22 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     progress_bar = st.progress(0)
     percent_text = st.empty()
 
-    total_sec = sum(t.get("duration_seconds", 0) for t in timeline)
+    total_sec = sum(max(sc["end"] - sc["start"], 0.1) for sc in scenes)
     total_frames_all = max(int(total_sec * fps), 1)
     current_frame = 0
 
-    for item in timeline:
+    for sc in scenes:
         if st.session_state.stop_requested:
             st.warning("⛔ Stopped during rendering.")
             out.release()
             return None
 
-        img_name = item.get("image")
-        duration = float(item.get("duration_seconds", 0) or 0)
-
-        if not img_name or img_name not in image_map or duration <= 0:
+        duration = max(float(sc["end"] - sc["start"]), 0.2)
+        img_bytes = sc["image_data"]
+        if not img_bytes:
             continue
 
-        image_map[img_name].seek(0)
-        file_bytes = np.asarray(bytearray(image_map[img_name].read()), dtype=np.uint8)
+        file_bytes = np.asarray(bytearray(img_bytes), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, 1)
         if img is None:
             continue
@@ -622,13 +544,13 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
         return None
 
     if not os.path.exists(audio_abs):
-        st.error(f"❌ Audio file not found for FFmpeg: {audio_abs}")
+        st.error(f"❌ Audio file not found: {audio_abs}")
         return None
     if not os.path.exists(temp_video_abs):
         st.error(f"❌ Temp video not found: {temp_video_abs}")
         return None
 
-    st.write("🎵 Merging audio with video (FFmpeg)...")
+    st.write("🎵 Merging audio with video...")
     command = [
         "ffmpeg",
         "-y",
@@ -651,7 +573,7 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
     )
 
     if result.returncode != 0:
-        st.error("❌ FFmpeg failed while merging audio and video.")
+        st.error("❌ Video/audio merge failed.")
         st.code(result.stdout[-2000:])
         return None
 
@@ -669,192 +591,409 @@ def render_video(timeline, audio_path, image_map, output_name="final_video.mp4")
 
 
 # =========================
-# UI
+# SESSION STATE STRUCTURE
 # =========================
 
-st.title("🤖 AI Video Generator (Deepgram + Groq Vision/Text)")
+if "scenes" not in st.session_state:
+    # Each scene:
+    # {
+    #   "index": int,
+    #   "start": float,
+    #   "end": float,
+    #   "text": str,
+    #   "prompt": str,
+    #   "image_name": str or None,
+    #   "image_data": bytes or None
+    # }
+    st.session_state.scenes = []
+
+if "audio_path" not in st.session_state:
+    st.session_state.audio_path = None
+
+if "audio_duration" not in st.session_state:
+    st.session_state.audio_duration = None
+
+if "transcription_raw" not in st.session_state:
+    st.session_state.transcription_raw = None
+
+if "prompt_raw" not in st.session_state:
+    st.session_state.prompt_raw = None
+
+# =========================
+# SIDEBAR SETTINGS (NO BRAND NAMES)
+# =========================
+
+with st.sidebar:
+    st.header("Image Settings")
+
+    mode_label = st.selectbox(
+        "Image mode",
+        ["1.5-Fast", "1.0-Slow"],
+        index=0,
+        help="Choose which style/engine mode to use.",
+    )
+
+    aspect_ratio = st.selectbox(
+        "Aspect ratio",
+        ["16:9", "9:16", "1:1"],
+        index=0,
+        help="Select the output aspect ratio.",
+    )
+
+    timeout = st.slider("Image request timeout (seconds)", 10, 180, 60)
+
+    st.button("🛑 Stop processing", on_click=request_stop)
+
+
+# =========================
+# MAIN UI
+# =========================
+
+st.title("🎬 AI Video Generator")
+
 st.markdown(
     """
-**Pipeline Overview**
+**Flow:**
 
-1. **Deepgram** – Voiceover se transcript + timestamps + multiple chunks  
-2. **Groq Vision** – Har image pe: "What is in this image? What is happening?" (English description)  
-3. **Groq Text** – Voiceover chunks + image descriptions → semantic mapping (chunk → best image)  
-4. **Timeline** – Deepgram time se sync, Groq mapping + strong fallback  
-5. **OpenCV + FFmpeg** – Frames render + audio merge, progress + stop button  
-
-Neeche expanders me har step ka JSON dekh sakte ho.
+1. Voiceover se transcript + timestamps + scenes  
+2. Har scene ke liye automatic image prompts  
+3. Har scene ka prompt edit + image generate / regenerate  
+4. Final review screen: voiceover text + prompt + image  
+5. Jab tum confirm karo, tab video render (timestamps = 100% sync)  
 """
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
-with col2:
-    uploaded_images = st.file_uploader(
-        "Upload images (max ~50, story-related)",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-    )
+audio_file = st.file_uploader("Upload voiceover (MP3)", type=["mp3"])
 
-st.button("🛑 Stop processing", on_click=request_stop)
+st.divider()
 
-if st.button("🚀 Generate video", type="primary"):
+col_btn1, col_btn2 = st.columns(2)
+with col_btn1:
+    analyze = st.button("1️⃣ Analyze Voiceover & Create Scenes", type="primary")
+with col_btn2:
+    reset = st.button("♻️ Reset / Clear")
+
+if reset:
+    st.session_state.scenes = []
+    st.session_state.audio_path = None
+    st.session_state.audio_duration = None
+    st.session_state.transcription_raw = None
+    st.session_state.prompt_raw = None
+    st.session_state.stop_requested = False
+    st.success("State cleared.")
+    st.stop()
+
+# =========================
+# STEP 1: ANALYZE (TRANSCRIPT + PROMPTS)
+# =========================
+
+if analyze:
     st.session_state.stop_requested = False
 
-    if not audio_file or not uploaded_images:
-        st.error("Please upload both audio and images first.")
-    else:
-        # ============ Init debug holders ============
-        deepgram_raw = None
-        image_desc_raw_list = []
-        image_desc_map = {}
-        mappings = []
-        mapping_raw = None
-        timeline = []
-        full_text = ""
-        chunks = []
+    if not audio_file:
+        st.error("Please upload an MP3 voiceover first.")
+        st.stop()
 
-        if len(uploaded_images) > 50:
-            st.warning(
-                f"⚠️ {len(uploaded_images)} images uploaded. "
-                "Using only the first 50 for analysis + mapping."
-            )
-            uploaded_images = uploaded_images[:50]
+    status = st.status("Starting analysis...", expanded=True)
 
-        status = st.status("Starting process...", expanded=True)
+    # Clean temp
+    status.write("🧹 Cleaning temp folder...")
+    clean_temp_dir()
 
-        status.write("🧹 Cleaning temp folder...")
-        clean_temp_dir()
+    # Save audio
+    status.write("💾 Saving audio file...")
+    local_audio = os.path.join(TEMP_DIR, "input.mp3")
+    local_audio = os.path.abspath(local_audio)
+    with open(local_audio, "wb") as f:
+        f.write(audio_file.getbuffer())
 
-        # Save audio
-        status.write("💾 Saving audio file...")
-        local_audio = os.path.join(TEMP_DIR, "input.mp3")
-        local_audio = os.path.abspath(local_audio)
-        with open(local_audio, "wb") as f:
-            f.write(audio_file.getbuffer())
+    if not os.path.exists(local_audio):
+        st.error("❌ Failed to save audio file.")
+        st.stop()
 
-        if os.path.exists(local_audio):
-            size_kb = os.path.getsize(local_audio) / 1024
-            st.info(f"Audio saved: {local_audio} ({size_kb:.1f} KB)")
-        else:
-            st.error("❌ Failed to save audio file.")
-            st.stop()
+    audio_duration = get_audio_duration(local_audio)
+    st.session_state.audio_path = local_audio
+    st.session_state.audio_duration = audio_duration
 
-        audio_duration = get_audio_duration(local_audio)
-        if audio_duration:
-            st.info(f"⏱️ Audio duration (ffprobe): ~{audio_duration:.2f} seconds")
+    if audio_duration:
+        status.write(f"⏱️ Audio duration: ~{audio_duration:.2f} seconds")
 
-        if st.session_state.stop_requested:
-            st.warning("⛔ Stopped by user.")
-            st.stop()
+    if st.session_state.stop_requested:
+        st.warning("⛔ Stopped by user.")
+        st.stop()
 
-        # Deepgram
-        status.write("👂 Getting transcript + timestamps (Deepgram)...")
-        full_text, chunks, deepgram_raw = get_transcript_chunks(
-            local_audio, audio_duration=audio_duration
+    # Transcription
+    status.write("👂 Getting transcript + timestamps...")
+    full_text, chunks, raw = get_transcript_chunks(
+        local_audio, audio_duration=audio_duration
+    )
+    st.session_state.transcription_raw = raw
+
+    if not chunks:
+        st.error("❌ No scenes found from voiceover.")
+        st.stop()
+
+    if st.session_state.stop_requested:
+        st.warning("⛔ Stopped by user.")
+        st.stop()
+
+    # Text model: prompts
+    status.write("🧠 Generating image prompts for each scene...")
+    prompts_map, prompt_raw = generate_image_prompts_for_chunks(chunks)
+    st.session_state.prompt_raw = prompt_raw
+
+    if not prompts_map:
+        status.update(label="❌ Prompt generation failed.", state="error", expanded=True)
+        st.stop()
+
+    # Build scenes
+    scenes = []
+    for c in chunks:
+        idx = c["index"]
+        scenes.append(
+            {
+                "index": idx,
+                "start": float(c["start"]),
+                "end": float(c["end"]),
+                "text": c["text"],
+                "prompt": prompts_map.get(idx, ""),
+                "image_name": None,
+                "image_data": None,
+            }
         )
 
-        image_names = [img.name for img in uploaded_images]
+    st.session_state.scenes = scenes
+    status.update(label="✅ Scenes created!", state="complete", expanded=False)
+    st.success("Scenes created. Scroll down to edit prompts and generate images.")
 
-        if not chunks:
-            status.write("⚠️ No chunks from Deepgram, falling back to simple slideshow.")
-            dummy_chunks = []
-            if audio_duration and image_names:
-                avg_dur = audio_duration / max(len(image_names), 1)
-                t = 0.0
-                for i, name in enumerate(image_names, start=1):
-                    dummy_chunks.append(
-                        {"index": i, "text": "", "start": t, "end": t + avg_dur}
+
+# =========================
+# SCENE EDITOR (PROMPT + IMAGE)
+# =========================
+
+scenes = st.session_state.scenes
+audio_path = st.session_state.audio_path
+
+if scenes:
+    st.subheader("2️⃣ Scene Prompts & Images (Editing)")
+
+    st.caption(
+        "Har scene voiceover se linked hai. Prompt edit karo, phir image generate / regenerate karo."
+    )
+
+    # Bulk generate for scenes without image
+    if st.button("🖼️ Generate images for ALL scenes without image"):
+        for sc in scenes:
+            if st.session_state.stop_requested:
+                st.warning("⛔ Stopped by user.")
+                break
+            if sc["image_data"]:
+                continue
+            try:
+                with st.spinner(f"Generating image for scene {sc['index']}..."):
+                    fname, data, _ = generate_image_from_prompt(
+                        sc["prompt"],
+                        aspect_ratio,
+                        mode_label,
+                        IMAGE_API_KEY,
+                        timeout=timeout,
                     )
-                    t += avg_dur
-            chunks = dummy_chunks
+                    sc["image_name"] = fname
+                    sc["image_data"] = data
+            except Exception as e:
+                st.error(f"Scene {sc['index']} image error: {e}")
+        st.session_state.scenes = scenes
+        st.experimental_rerun()
 
-        if st.session_state.stop_requested:
-            st.warning("⛔ Stopped by user.")
-            st.stop()
+    st.divider()
 
-        # Groq Vision: descriptions
-        status.write("👁️ Describing ALL images with Groq Vision...")
-        image_desc_map, image_desc_raw_list = describe_all_images_with_groq(
-            uploaded_images
+    # Per-scene editing UI
+    for sc in scenes:
+        idx = sc["index"]
+        start = sc["start"]
+        end = sc["end"]
+        text = sc["text"]
+
+        with st.container():
+            st.markdown(f"### 🎬 Scene {idx}")
+            st.caption(f"Time: {start:.2f}s → {end:.2f}s  |  Duration: {end - start:.2f}s")
+
+            st.text_area(
+                "Voiceover text (read-only)",
+                value=text,
+                key=f"scene_text_{idx}",
+                height=80,
+                disabled=True,
+            )
+
+            # Editable prompt (this will be used for image generation)
+            prompt_key = f"scene_prompt_{idx}"
+            if prompt_key not in st.session_state:
+                st.session_state[prompt_key] = sc["prompt"]
+
+            new_prompt = st.text_area(
+                "Image prompt",
+                key=prompt_key,
+                height=80,
+            )
+            sc["prompt"] = new_prompt
+
+            col_a, col_b = st.columns([1, 2])
+
+            with col_a:
+                gen_label = "Generate image" if not sc["image_data"] else "Regenerate image"
+                if st.button(gen_label, key=f"gen_btn_{idx}"):
+                    try:
+                        with st.spinner(f"Generating image for scene {idx}..."):
+                            fname, data, _ = generate_image_from_prompt(
+                                sc["prompt"],
+                                aspect_ratio,
+                                mode_label,
+                                IMAGE_API_KEY,
+                                timeout=timeout,
+                            )
+                            sc["image_name"] = fname
+                            sc["image_data"] = data
+                            st.session_state.scenes = scenes
+                            st.experimental_rerun()
+                    except Exception as e:
+                        st.error(f"Image error (scene {idx}): {e}")
+
+            with col_b:
+                if sc["image_data"]:
+                    st.image(
+                        sc["image_data"],
+                        caption=f"{sc['image_name'] or 'Scene image'}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("No image generated yet for this scene.")
+
+            st.markdown("---")
+
+    st.divider()
+
+    # =========================
+    # FINAL REVIEW (VOICEOVER + PROMPT + IMAGE) BEFORE RENDER
+    # =========================
+
+    st.subheader("3️⃣ Final Review (Text + Prompts + Images)")
+
+    st.caption(
+        "Yahan se tum last time sab check kar sakte ho. Isi screen se prompt change + image regenerate bhi kar sakte ho. "
+        "Jab sab scenes sahi lagte hain, tab neeche se video render karo."
+    )
+
+    missing = [sc["index"] for sc in scenes if not sc["image_data"]]
+    if missing:
+        st.warning(
+            f"These scenes have no image yet: {missing}. "
+            "Har scene k liye image generate karo before rendering."
         )
 
-        if st.session_state.stop_requested:
-            st.warning("⛔ Stopped by user.")
-            st.stop()
+    # Compact table-like review with edit/regenerate again (same state share hoga)
+    for sc in scenes:
+        idx = sc["index"]
+        start = sc["start"]
+        end = sc["end"]
 
-        # Groq Text: mapping
-        if image_desc_map:
-            status.write("🧠 Mapping chunks → images (Groq Text)...")
-            mappings, mapping_raw = map_chunks_to_images_using_descriptions(
-                chunks, image_desc_map
+        with st.expander(f"Scene {idx} – {start:.2f}s → {end:.2f}s", expanded=False):
+            st.write("**Voiceover text:**")
+            st.write(sc["text"])
+
+            # same prompt key reuse
+            prompt_key = f"scene_prompt_{idx}"
+            new_prompt = st.text_area(
+                "Final prompt (you can still edit)",
+                key=prompt_key + "_final",
+                value=st.session_state.get(prompt_key, sc["prompt"]),
+                height=80,
             )
-            status.write("🧩 Building final timeline (mapping + timestamps)...")
-            timeline = build_timeline_with_mapping(
-                chunks, mappings, image_names, audio_duration=audio_duration
-            )
+            # Update both original + final references
+            st.session_state[prompt_key] = new_prompt
+            sc["prompt"] = new_prompt
+
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                gen_label = "Generate image" if not sc["image_data"] else "Regenerate image"
+                if st.button(gen_label, key=f"final_gen_btn_{idx}"):
+                    try:
+                        with st.spinner(f"Generating image for scene {idx} (final review)..."):
+                            fname, data, _ = generate_image_from_prompt(
+                                sc["prompt"],
+                                aspect_ratio,
+                                mode_label,
+                                IMAGE_API_KEY,
+                                timeout=timeout,
+                            )
+                            sc["image_name"] = fname
+                            sc["image_data"] = data
+                            st.session_state.scenes = scenes
+                            st.experimental_rerun()
+                    except Exception as e:
+                        st.error(f"Image error (scene {idx}): {e}")
+
+            with col2:
+                if sc["image_data"]:
+                    st.image(
+                        sc["image_data"],
+                        caption=f"{sc['image_name'] or 'Scene image'}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("No image generated yet for this scene.")
+
+    st.divider()
+
+    # Final render button
+    if st.button("✅ Finalize & Render Video", type="primary"):
+        if not audio_path or not os.path.exists(audio_path):
+            st.error("Audio file not found. Please re-analyze the voiceover.")
+        elif missing:
+            st.error("Some scenes have no image. Generate all images first.")
         else:
-            status.write(
-                "⚠️ No image descriptions available, using sequential mapping only."
-            )
-            timeline = build_timeline_sequential(
-                chunks, image_names, audio_duration=audio_duration
-            )
+            st.session_state.stop_requested = False
+            with st.spinner("Rendering video..."):
+                final_vid_path = render_video_from_scenes(
+                    st.session_state.scenes, audio_path
+                )
 
-        if st.session_state.stop_requested:
-            st.warning("⛔ Stopped by user.")
-            st.stop()
+            if final_vid_path is None:
+                st.warning("⛔ Video generation failed or stopped.")
+            else:
+                st.success("🎉 Video rendered successfully!")
+                with open(final_vid_path, "rb") as f:
+                    video_bytes = f.read()
 
-        # Render video
-        status.write("🎬 Rendering video with OpenCV + FFmpeg...")
-        image_map = {img.name: img for img in uploaded_images}
-        final_vid_path = render_video(timeline, local_audio, image_map)
+                st.video(video_bytes)
+                st.download_button(
+                    "⬇️ Download video",
+                    data=video_bytes,
+                    file_name="AI_Video.mp4",
+                    mime="video/mp4",
+                )
 
-        if final_vid_path is None or st.session_state.stop_requested:
-            st.warning("⛔ Processing stopped before completion or video failed.")
-            st.stop()
+# =========================
+# DEBUG EXPANDERS
+# =========================
 
-        status.update(label="✅ Video rendered!", state="complete", expanded=False)
-        if audio_duration:
-            st.success(f"Video rendered! (≈ {int(audio_duration)} seconds)")
-        else:
-            st.success("Video rendered! You can watch or download it below.")
-
-        with open(final_vid_path, "rb") as f:
-            video_bytes = f.read()
-
-        st.video(video_bytes)
-
-        st.download_button(
-            "⬇️ Download video",
-            data=video_bytes,
-            file_name="AI_Gen_Video.mp4",
-            mime="video/mp4",
+if st.session_state.transcription_raw:
+    with st.expander("🧩 Transcription Output (raw JSON + scenes)", expanded=False):
+        st.subheader("Raw transcription JSON")
+        st.json(st.session_state.transcription_raw)
+        st.subheader("Scenes (index, start, end, text)")
+        st.json(
+            [
+                {
+                    "index": sc["index"],
+                    "start": sc["start"],
+                    "end": sc["end"],
+                    "text": sc["text"],
+                }
+                for sc in st.session_state.scenes
+            ]
         )
 
-        # DEBUG PANELS
-
-        with st.expander("🧩 Deepgram Output (raw JSON + chunks + transcript)"):
-            st.subheader("Raw Deepgram JSON (full)")
-            st.json(deepgram_raw)
-            st.subheader("Transcript (combined text)")
-            st.write(full_text)
-            st.subheader("Chunks (index, text, start, end)")
-            st.json(chunks)
-
-        with st.expander("👁️ Groq Vision – Image Descriptions"):
-            st.markdown("**Raw responses per image (JSON exactly as Groq returned):**")
-            for idx, raw in enumerate(image_desc_raw_list, start=1):
-                st.markdown(f"**Image {idx}**")
-                st.json(raw)
-            st.subheader("Final aggregated map: filename → description")
-            st.json(image_desc_map)
-
-        with st.expander("🧠 Groq Text – Mapping + Timeline"):
-            st.subheader("Raw mapping JSON from Groq Text (as is)")
-            st.json(mapping_raw)
-            st.subheader("Cleaned mappings (chunk_index → image filename)")
-            st.json(mappings)
-            st.subheader("Final timeline used for rendering (image + duration_seconds)")
-            st.json(timeline)
+if st.session_state.prompt_raw:
+    with st.expander("🧠 Image prompts (raw model output)", expanded=False):
+        st.text(st.session_state.prompt_raw)
