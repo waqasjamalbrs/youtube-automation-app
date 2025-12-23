@@ -47,7 +47,7 @@ except Exception:
     st.error("🚨 Please add DEEPGRAM_API_KEY in Streamlit secrets.")
     st.stop()
 
-# Text model API key
+# Text model API key (Groq)
 GROQ_KEY = st.secrets.get("GROQ_API_KEY")
 if not GROQ_KEY:
     st.error("🚨 Please add GROQ_API_KEY in Streamlit secrets.")
@@ -61,7 +61,7 @@ if not IMAGE_API_KEY:
     st.error("🚨 Please add image API key in Streamlit secrets as YOUSMIND_API_KEY.")
     st.stop()
 
-# Internal image API URL (hidden from UI)
+# Internal image API URL (hidden from UI name)
 IMAGE_API_URL = "https://yousmind.com/api/image-generator/generate"
 
 # =========================
@@ -128,9 +128,7 @@ def get_audio_duration(audio_path: str):
 
 
 def download_image(url: str, timeout: int = 60) -> Tuple[str, bytes]:
-    """
-    Download an image from a URL.
-    """
+    """Download an image from a URL."""
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
 
@@ -284,7 +282,7 @@ def get_transcript_chunks(
 
 
 # =========================
-# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT + STYLE)
+# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT + STYLE) WITH BATCHING
 # =========================
 
 def generate_image_prompts_for_chunks(chunks, global_style_text: str = ""):
@@ -292,42 +290,49 @@ def generate_image_prompts_for_chunks(chunks, global_style_text: str = ""):
     Har chunk ke liye ek image-generation prompt.
     Output: plain text, JSON nahi.
 
-    Expected format:
+    Expected format from Groq:
 
       Scene 1: cinematic prompt...
       Scene 2: another prompt...
       ...
 
     global_style_text → e.g. "black and white, high contrast, documentary style"
+
+    Batching + fallback:
+      - Groq ko batches me call karte hain (default 15 scenes per call)
+      - Agar model kuch scenes skip kar de, un ke liye simple fallback prompt bana dete hain
     """
     if not chunks:
         return {}, None
 
     model_id = "llama-3.1-8b-instant"
+    batch_size = 15  # 15 scenes per Groq call, lambi audio ke liye safe
 
-    chunks_brief = []
-    for c in chunks:
-        text = c.get("text", "")
-        if len(text) > 400:
-            text = text[:400] + "..."
-        chunks_brief.append(
-            {
-                "index": c["index"],
-                "start": round(float(c["start"]), 2),
-                "end": round(float(c["end"]), 2),
-                "text": text,
-            }
-        )
+    def call_model_for_subset(sub_chunks):
+        """Ek subset of chunks (list) ke liye Groq se prompts mangta hai."""
+        chunks_brief = []
+        for c in sub_chunks:
+            text = c.get("text", "")
+            if len(text) > 400:
+                text = text[:400] + "..."
+            chunks_brief.append(
+                {
+                    "index": c["index"],  # global scene index
+                    "start": round(float(c["start"]), 2),
+                    "end": round(float(c["end"]), 2),
+                    "text": text,
+                }
+            )
 
-    style_instruction = ""
-    if global_style_text:
-        style_instruction = f"""
+        style_instruction = ""
+        if global_style_text:
+            style_instruction = f"""
 GLOBAL STYLE PREFERENCE:
 The user wants all images in this style: "{global_style_text}".
 Make sure every scene prompt explicitly reflects this visual style.
 """
 
-    prompt = f"""
+        prompt = f"""
 You are an AI storyboard artist for a video.
 
 You receive a list of narration CHUNKS from a voiceover, each with:
@@ -368,51 +373,77 @@ Rules:
 - Do not use JSON.
 """
 
-    try:
-        resp = groq_client.chat.completions.create(
-            model=model_id,
-            messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=4096,
-            temperature=0.4,
-        )
-        text = resp.choices[0].message.content or ""
-    except Exception as e:
-        st.error(f"❌ Failed to generate image prompts: {e}")
-        return {}, None
+        try:
+            resp = groq_client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=2048,
+                temperature=0.4,
+            )
+            text = resp.choices[0].message.content or ""
+        except Exception as e:
+            # Agar pura batch hi fail ho jaye to empty return karein,
+            # baad me fallback prompts use kar lenge.
+            st.error(f"❌ Failed to generate image prompts for a batch: {e}")
+            return {}, ""
 
-    raw_text = text
+        # Parse lines: Scene <index>: <prompt>
+        local_map = {}
+        for line in text.splitlines():
+            m = re.match(r"\s*Scene\s+(\d+)\s*:\s*(.+)", line, re.IGNORECASE)
+            if m:
+                idx = int(m.group(1))
+                pmt = m.group(2).strip()
+                if pmt:
+                    local_map[idx] = pmt
 
-    # Parse lines: Scene <index>: <prompt>
-    prompts_map = {}
-    for line in raw_text.splitlines():
-        m = re.match(r"\s*Scene\s+(\d+)\s*:\s*(.+)", line, re.IGNORECASE)
-        if m:
-            idx = int(m.group(1))
-            pmt = m.group(2).strip()
-            if pmt:
-                prompts_map[idx] = pmt
+        return local_map, text
 
-    # Strict: har chunk k liye prompt required
+    # ---- Batching over all chunks ----
+    all_prompts_map = {}
+    raw_text_pieces = []
+
+    for i in range(0, len(chunks), batch_size):
+        sub = chunks[i: i + batch_size]
+        local_map, raw_text = call_model_for_subset(sub)
+        all_prompts_map.update(local_map)
+        if raw_text:
+            raw_text_pieces.append(f"=== BATCH {i // batch_size + 1} ===\n{raw_text}")
+
+    raw_text_all = "\n\n".join(raw_text_pieces) if raw_text_pieces else None
+
+    # ---- Fallback for missing scenes ----
     expected_indexes = {c["index"] for c in chunks}
-    missing = sorted(list(expected_indexes - set(prompts_map.keys())))
-    if missing:
-        st.error(
-            f"❌ Some scene prompts are missing from the AI response. "
-            f"Missing scene indexes: {missing}\n\n"
-            "Open the 'Image prompts' debug expander, check the model output, "
-            "and try again."
-        )
-        return {}, raw_text
+    missing = sorted(list(expected_indexes - set(all_prompts_map.keys())))
 
-    # Extra safety: global style suffix append
+    if missing:
+        st.warning(
+            f"⚠️ Groq did not return prompts for these scene indexes: {missing}. "
+            "Using simple fallback prompts based on the scene text. "
+            "You can edit them in the UI before generating images."
+        )
+
+        for idx in missing:
+            chunk = next((c for c in chunks if c["index"] == idx), None)
+            if not chunk:
+                continue
+            txt = chunk.get("text", "")
+            txt_short = (txt[:160] + "...") if len(txt) > 160 else txt
+
+            base_prompt = f"cinematic illustration of: {txt_short}"
+            if global_style_text:
+                base_prompt = base_prompt.rstrip(".") + f", {global_style_text}"
+
+            all_prompts_map[idx] = base_prompt
+
+    # Extra safety: ensure style suffix present
     if global_style_text:
         suffix = ", " + global_style_text
-        for idx, p in list(prompts_map.items()):
-            # agar style already mention nahi to append
+        for idx, p in list(all_prompts_map.items()):
             if global_style_text.lower() not in p.lower():
-                prompts_map[idx] = p.rstrip(".") + suffix
+                all_prompts_map[idx] = p.rstrip(".") + suffix
 
-    return prompts_map, raw_text
+    return all_prompts_map, raw_text_all
 
 
 # =========================
@@ -568,7 +599,7 @@ def render_video_from_scenes(
                 out.release()
                 return None
 
-            # Zoom in + out wave: minimum at edges, max at center
+            # Zoom in + out wave: min at edges, max at center
             t = i / max(frames_in_clip - 1, 1)  # 0 → 1
             centered = 2 * t - 1                 # -1 → 1
             amp = 1 - abs(centered)             # 0 → 1 → 0
@@ -892,7 +923,7 @@ if analyze:
     full_text, chunks, raw = get_transcript_chunks(
         local_audio,
         audio_duration=audio_duration,
-        max_chunk_duration=5.0,   # enforce ~5s chunks
+        max_chunk_duration=5.0,
         max_words_per_chunk=25,
     )
     st.session_state.transcription_raw = raw
