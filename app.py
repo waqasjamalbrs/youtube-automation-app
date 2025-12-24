@@ -166,7 +166,7 @@ def get_transcript_chunks(
     audio_duration=None,
     max_gap=1.5,
     max_words_per_chunk=25,
-    max_chunk_duration=30.0,  # no strict 5s; mostly silence + words decide
+    max_chunk_duration=30.0,
 ):
     """
     Transcription API:
@@ -176,14 +176,6 @@ def get_transcript_chunks(
         - agar words ke beech bohot gap ho (silence)
         - YA words count zyada ho jaye
         - YA chunk ki duration bohot badi ho jaye
-
-    Return:
-        full_text (str),
-        chunks = [
-          {"index": 1, "text": "...", "start": 0.5, "end": 7.8},
-          ...
-        ],
-        raw (dict)
     """
     url = "https://api.deepgram.com/v1/listen"
 
@@ -287,27 +279,19 @@ def get_transcript_chunks(
 
 
 # =========================
-# TEXT MODEL: CHUNKS → IMAGE PROMPTS (PLAIN TEXT, GROQ LLAMA-4 MAVERICK)
+# TEXT MODEL: CHUNKS → IMAGE PROMPTS
 # =========================
 
 def generate_image_prompts_for_chunks(chunks):
     """
     Har chunk ke liye ek image-generation prompt.
-    Model se output **plain text** me lenge, JSON nahi.
-    Format jo hum expect kar rahe hain:
-
-      Scene 1: cinematic prompt...
-      Scene 2: another prompt...
-      Scene 3: ...
-
-    Return:
-        prompts_map: {chunk_index: prompt_str}
-        raw_text: str (model ka raw response)
+    Response format (text only):
+      Scene 1: ...
+      Scene 2: ...
     """
     if not chunks:
         return {}, None
 
-    # Groq Llama 4 Maverick model
     model_id = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
     chunks_brief = []
@@ -339,8 +323,7 @@ Goals:
 - Each prompt must closely match the meaning and mood of that chunk.
 - Imagine this is for a cinematic video.
 - Use clear, specific English.
-- You can mention camera / composition / lighting when helpful
-  (e.g. "wide shot", "close-up", "cinematic lighting", "dramatic shadows").
+- You can mention camera / composition / lighting when helpful.
 - Do NOT mention the word "chunk", "voiceover", "caption", or any subtitles.
 - Do NOT add anything about on-screen text or UI.
 - Keep each prompt as a single sentence or short paragraph focused on visuals only.
@@ -351,17 +334,6 @@ CHUNKS:
 RESPONSE FORMAT (TEXT ONLY, NO JSON):
 - For EACH chunk, write exactly ONE line in this format:
   Scene <index>: <image prompt>
-
-Examples of lines:
-  Scene 1: wide shot of a busy city at night, cinematic lighting, blue and orange colors
-  Scene 2: close-up of a worried mother holding her child in a small apartment
-
-Rules:
-- Use the exact word "Scene" (capital S), then a space, then the chunk index,
-  then a colon, then a space, then the prompt.
-- EXACTLY one line per chunk index.
-- Do not add any extra commentary before or after the list.
-- Do not use JSON.
 """
 
     try:
@@ -378,7 +350,6 @@ Rules:
 
     raw_text = text
 
-    # Parse lines: Scene <index>: <prompt>
     prompts_map = {}
     for line in raw_text.splitlines():
         m = re.match(r"\s*Scene\s+(\d+)\s*:\s*(.+)", line, re.IGNORECASE)
@@ -388,7 +359,6 @@ Rules:
             if pmt:
                 prompts_map[idx] = pmt
 
-    # Strict: har chunk k liye prompt required
     expected_indexes = {c["index"] for c in chunks}
     missing = sorted(list(expected_indexes - set(prompts_map.keys())))
     if missing:
@@ -451,7 +421,7 @@ def generate_image_from_prompt(prompt, aspect_ratio, mode_label, api_key, timeou
 
 
 # =========================
-# VIDEO RENDERING FROM SCENES (FRAME-BASED SYNC)
+# VIDEO RENDERING FROM SCENES
 # =========================
 
 def render_video_from_scenes(
@@ -472,11 +442,6 @@ def render_video_from_scenes(
           "image_name": str,
           "image_data": bytes
         }
-
-    Sync:
-        - Frame-based: har scene ka start/end Deepgram timestamps *fps* se
-          frames me convert hota hai, isi se frames_in_clip nikalte hain.
-        - Is se floor/rounding drift accumulate nahi hota.
     """
     if not scenes:
         st.error("No scenes to render.")
@@ -548,12 +513,10 @@ def render_video_from_scenes(
                 out.release()
                 return None
 
-            # zoom_strength slider se control
             scale = 1.0 + (zoom_strength * i / frames_in_clip)
             M = cv2.getRotationMatrix2D((width // 2, height // 2), 0, scale)
             frame = cv2.warpAffine(img, M, (width, height))
 
-            # black & white option
             if color_mode == "Black & white":
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -581,8 +544,6 @@ def render_video_from_scenes(
 
     st.write("🎵 Merging audio with video...")
 
-    audio_duration = st.session_state.get("audio_duration", None)
-
     command = [
         "ffmpeg",
         "-y",
@@ -595,14 +556,6 @@ def render_video_from_scenes(
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
-    ]
-
-    # ⏱️ Final output duration = audio duration (if known)
-    if audio_duration:
-        command += ["-t", f"{float(audio_duration):.3f}"]
-
-    # Safety: also keep -shortest in case of tiny float differences
-    command += [
         "-shortest",
         final_output_abs,
     ]
@@ -651,6 +604,14 @@ if "transcription_raw" not in st.session_state:
 if "prompt_raw" not in st.session_state:
     st.session_state.prompt_raw = None
 
+# ✅ store rendered video persistently
+if "final_video_bytes" not in st.session_state:
+    st.session_state.final_video_bytes = None
+
+if "final_video_name" not in st.session_state:
+    st.session_state.final_video_name = "AI_Video.mp4"
+
+
 # =========================
 # SIDEBAR SETTINGS
 # =========================
@@ -674,7 +635,6 @@ with st.sidebar:
 
     timeout = st.slider("Image request timeout (seconds)", 10, 180, 60)
 
-    # Video look settings
     color_mode = st.radio(
         "Video color mode",
         ["Color", "Black & white"],
@@ -717,6 +677,8 @@ if reset:
     st.session_state.audio_duration = None
     st.session_state.transcription_raw = None
     st.session_state.prompt_raw = None
+    st.session_state.final_video_bytes = None
+    st.session_state.final_video_name = "AI_Video.mp4"
     st.session_state.stop_requested = False
     st.success("State cleared.")
     st.stop()
@@ -760,7 +722,7 @@ if analyze:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # Transcription (no enforced 5s max, default settings)
+    # Transcription
     status.write("👂 Getting transcript + timestamps...")
     full_text, chunks, raw = get_transcript_chunks(
         local_audio, audio_duration=audio_duration
@@ -775,7 +737,7 @@ if analyze:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # Text model: prompts (Groq Llama-4 Maverick)
+    # Text model: prompts
     status.write("🧠 Generating image prompts for each scene (Groq Llama-4 Maverick)...")
     prompts_map, prompt_raw = generate_image_prompts_for_chunks(chunks)
     st.session_state.prompt_raw = prompt_raw
@@ -784,7 +746,7 @@ if analyze:
         status.update(label="❌ Prompt generation failed.", state="error", expanded=True)
         st.stop()
 
-    # Build scenes (text + prompts)
+    # Build scenes
     scenes = []
     for c in chunks:
         idx = c["index"]
@@ -800,13 +762,14 @@ if analyze:
             }
         )
 
-    # ✅ Ensure last scene is at least as long as audio (avoid missing tail)
+    # ✅ last scene audio se 2s zyada
     if st.session_state.audio_duration and scenes:
         ad = float(st.session_state.audio_duration)
-        if scenes[-1]["end"] < ad:
-            scenes[-1]["end"] = ad
+        target_end = ad + 2.0
+        if scenes[-1]["end"] < target_end:
+            scenes[-1]["end"] = target_end
 
-    # Auto-generate images for all scenes right here
+    # Auto-generate images
     status.write("🖼️ Generating images for all scenes...")
     img_progress = st.progress(0.0)
     total_scenes = len(scenes)
@@ -859,7 +822,7 @@ if scenes:
         "Har scene voiceover se linked hai. Prompt edit karo, phir image generate / regenerate karo."
     )
 
-    # Optional: Bulk generate for scenes without image (fallback)
+    # Bulk generate missing images
     if st.button("🖼️ Generate images for ALL scenes without image"):
         for sc in scenes:
             if st.session_state.stop_requested:
@@ -885,7 +848,7 @@ if scenes:
 
     st.divider()
 
-    # Per-scene editing UI
+    # Per-scene UI
     for sc in scenes:
         idx = sc["index"]
         start = sc["start"]
@@ -904,7 +867,6 @@ if scenes:
                 disabled=True,
             )
 
-            # Editable prompt (this will be used for image generation)
             prompt_key = f"scene_prompt_{idx}"
             if prompt_key not in st.session_state:
                 st.session_state[prompt_key] = sc["prompt"]
@@ -952,14 +914,13 @@ if scenes:
     st.divider()
 
     # =========================
-    # FINAL REVIEW (VOICEOVER + PROMPT + IMAGE) BEFORE RENDER
+    # FINAL REVIEW
     # =========================
 
     st.subheader("Final Review (Text + Prompts + Images)")
 
     st.caption(
-        "Yahan se tum last time sab check kar sakte ho. Isi screen se prompt change + image regenerate bhi kar sakte ho. "
-        "Jab sab scenes sahi lagte hain, tab neeche se video render karo."
+        "Yahan se last check karo. Prompts edit karo, images regenerate karo, phir neeche se video render karo."
     )
 
     missing = [sc["index"] for sc in scenes if not sc["image_data"]]
@@ -969,7 +930,6 @@ if scenes:
             "Har scene k liye image generate karo before rendering."
         )
 
-    # Compact review with edit/regenerate again
     for sc in scenes:
         idx = sc["index"]
         start = sc["start"]
@@ -988,7 +948,6 @@ if scenes:
                 height=80,
             )
 
-            # final prompt bhi scene obj me update
             sc["prompt"] = new_prompt_final
 
             col1, col2 = st.columns([1, 2])
@@ -1023,7 +982,10 @@ if scenes:
 
     st.divider()
 
-    # Final render button
+    # =========================
+    # FINAL RENDER BUTTON
+    # =========================
+
     if st.button("✅ Finalize & Render Video", type="primary"):
         if not audio_path or not os.path.exists(audio_path):
             st.error("Audio file not found. Please re-analyze the voiceover.")
@@ -1042,17 +1004,27 @@ if scenes:
             if final_vid_path is None:
                 st.warning("⛔ Video generation failed or stopped.")
             else:
-                st.success("🎉 Video rendered successfully!")
                 with open(final_vid_path, "rb") as f:
                     video_bytes = f.read()
 
-                st.video(video_bytes)
-                st.download_button(
-                    "⬇️ Download video",
-                    data=video_bytes,
-                    file_name="AI_Video.mp4",
-                    mime="video/mp4",
-                )
+                st.session_state.final_video_bytes = video_bytes
+                st.session_state.final_video_name = "AI_Video.mp4"
+
+                st.success("🎉 Video rendered successfully! Scroll down to preview & download.")
+
+# =========================
+# PERSISTENT PREVIEW + DOWNLOAD
+# =========================
+
+if st.session_state.final_video_bytes:
+    st.subheader("Preview & Download")
+    st.video(st.session_state.final_video_bytes)
+    st.download_button(
+        "⬇️ Download video",
+        data=st.session_state.final_video_bytes,
+        file_name=st.session_state.final_video_name,
+        mime="video/mp4",
+    )
 
 # =========================
 # DEBUG EXPANDERS
