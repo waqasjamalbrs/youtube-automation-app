@@ -282,12 +282,14 @@ def get_transcript_chunks(
 # TEXT MODEL: CHUNKS → IMAGE PROMPTS
 # =========================
 
-def generate_image_prompts_for_chunks(chunks):
+def generate_image_prompts_for_chunks(chunks, image_style: str = "", forbid_text: bool = True):
     """
     Har chunk ke liye ek image-generation prompt.
     Response format (text only):
       Scene 1: ...
       Scene 2: ...
+    image_style: UI se selected style (YouTube realistic, art, sketch, etc.)
+    forbid_text: agar True ho to har prompt me "no text..." add hoga.
     """
     if not chunks:
         return {}, None
@@ -308,6 +310,22 @@ def generate_image_prompts_for_chunks(chunks):
             }
         )
 
+    style_instruction = ""
+    if image_style:
+        style_instruction = f"""
+Overall visual style for ALL scenes:
+- {image_style}
+"""
+
+    no_text_instruction = ""
+    if forbid_text:
+        no_text_instruction = """
+VERY IMPORTANT TEXT RULE:
+- Every scene must be described so that the image has a CLEAN frame with NO words.
+- Do NOT show or include any text, letters, logos, watermarks, titles, subtitles, captions, or on-screen UI.
+- If you mention anything about text, explicitly say: "no text, no letters, no logos, no subtitles, no captions".
+"""
+
     prompt = f"""
 You are an expert cinematic storyboard artist.
 
@@ -321,12 +339,15 @@ Your job is to create ONE image-generation prompt PER chunk.
 
 Goals:
 - Each prompt must closely match the meaning and mood of that chunk.
-- Imagine this is for a cinematic video.
+- Imagine this is for a cinematic YouTube video (documentary style, engaging visuals).
 - Use clear, specific English.
-- You can mention camera / composition / lighting when helpful.
+- You can mention camera / composition / lighting when helpful
+  (e.g. "wide shot", "close-up", "cinematic lighting", "dramatic shadows").
 - Do NOT mention the word "chunk", "voiceover", "caption", or any subtitles.
 - Do NOT add anything about on-screen text or UI.
 - Keep each prompt as a single sentence or short paragraph focused on visuals only.
+{style_instruction}
+{no_text_instruction}
 
 CHUNKS:
 {json.dumps(chunks_brief, ensure_ascii=False, indent=2)}
@@ -357,6 +378,11 @@ RESPONSE FORMAT (TEXT ONLY, NO JSON):
             idx = int(m.group(1))
             pmt = m.group(2).strip()
             if pmt:
+                # Enforce no-text suffix (robustness for weak image models)
+                if forbid_text:
+                    suffix = "no text, no letters, no logos, no subtitles, no captions"
+                    # just append; duplicate doesn't hurt
+                    pmt = f"{pmt}, {suffix}"
                 prompts_map[idx] = pmt
 
     expected_indexes = {c["index"] for c in chunks}
@@ -633,6 +659,21 @@ with st.sidebar:
         help="Select the output aspect ratio.",
     )
 
+    # ✅ NEW: Image style / type
+    image_style = st.selectbox(
+        "Image style / type",
+        [
+            "YouTube documentary realistic",
+            "Cinematic realistic, film look",
+            "Digital painting / concept art",
+            "Watercolor / paint illustration",
+            "Sketch / stick-figure style",
+            "3D render, soft lighting",
+        ],
+        index=0,
+        help="Choose the overall visual style for all generated images.",
+    )
+
     timeout = st.slider("Image request timeout (seconds)", 10, 180, 60)
 
     color_mode = st.radio(
@@ -737,9 +778,13 @@ if analyze:
         st.warning("⛔ Stopped by user.")
         st.stop()
 
-    # Text model: prompts
+    # Text model: prompts (with style + no-text rule)
     status.write("🧠 Generating image prompts for each scene (Groq Llama-4 Maverick)...")
-    prompts_map, prompt_raw = generate_image_prompts_for_chunks(chunks)
+    prompts_map, prompt_raw = generate_image_prompts_for_chunks(
+        chunks,
+        image_style=image_style,
+        forbid_text=True,
+    )
     st.session_state.prompt_raw = prompt_raw
 
     if not prompts_map:
@@ -762,7 +807,7 @@ if analyze:
             }
         )
 
-    # ✅ last scene audio se 2s zyada
+    # last scene audio se 2s zyada (taake end cut na ho)
     if st.session_state.audio_duration and scenes:
         ad = float(st.session_state.audio_duration)
         target_end = ad + 2.0
