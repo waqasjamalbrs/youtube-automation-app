@@ -580,7 +580,9 @@ def render_video_from_scenes(
         return None
 
     st.write("🎵 Merging audio with video...")
-    # ✅ CHANGED: re-encode to H.264 + yuv420p for WhatsApp/YouTube compatibility
+
+    audio_duration = st.session_state.get("audio_duration", None)
+
     command = [
         "ffmpeg",
         "-y",
@@ -593,9 +595,18 @@ def render_video_from_scenes(
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
+    ]
+
+    # ⏱️ Final output duration = audio duration (if known)
+    if audio_duration:
+        command += ["-t", f"{float(audio_duration):.3f}"]
+
+    # Safety: also keep -shortest in case of tiny float differences
+    command += [
         "-shortest",
         final_output_abs,
     ]
+
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
@@ -789,11 +800,10 @@ if analyze:
             }
         )
 
-    # ✅ NEW: ensure last scene reaches full audio duration (avoid tail cut)
+    # ✅ Ensure last scene is at least as long as audio (avoid missing tail)
     if st.session_state.audio_duration and scenes:
         ad = float(st.session_state.audio_duration)
-        # only extend if noticeably shorter
-        if scenes[-1]["end"] < ad - 0.05:
+        if scenes[-1]["end"] < ad:
             scenes[-1]["end"] = ad
 
     # Auto-generate images for all scenes right here
